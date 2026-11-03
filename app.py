@@ -103,9 +103,9 @@ class OrganizerApp(tk.Tk):
         self.table = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="extended")
         for key, title, width in (
             ("category", "폴더", 170),
-            ("source", "파일", 410),
-            ("reason", "분류 조건", 175),
-            ("method", "읽기 방식 / 오류", 280),
+            ("source", "파일", 330),
+            ("reason", "분류 조건", 430),
+            ("method", "읽기 방식 / 오류", 240),
         ):
             self.table.heading(key, text=title, command=lambda column=key: self.sort_table(column))
             self.table.column(key, width=width, minwidth=70, stretch=False)

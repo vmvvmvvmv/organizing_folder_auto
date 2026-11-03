@@ -70,6 +70,40 @@ class AiGroupTests(unittest.TestCase):
         self.assertEqual(count, 0)
         self.assertEqual((ambiguous.folder, unreadable.folder), ("미분류", "미분류"))
 
+    def test_unclassified_preview_shows_best_candidate_score_and_gap(self):
+        garden = Document(Path("garden.pdf"), "garden", "common word", "PDF text", lead_text="plants")
+        health = Document(Path("health.pdf"), "health", "common word", "PDF text", lead_text="exercise")
+        low = Document(Path("low.pdf"), "미분류", "no common word", "PDF text", lead_text="unknown")
+        vectors = {
+            "garden.pdf": [1.0, 0.0],
+            "health.pdf": [0.0, 1.0],
+            "low.pdf": [0.65, 0.76],
+        }
+        count = assign_ai_folders(
+            [garden, health, low],
+            lambda texts: [vectors[text.split("\n", 1)[0]] for text in texts],
+        )
+        self.assertEqual(count, 0)
+        self.assertEqual(low.folder, "미분류")
+        self.assertIn("health", low.folder_reason)
+        self.assertIn("0.76", low.folder_reason)
+        self.assertIn("0.11", low.folder_reason)
+        self.assertIn("유사도 부족", low.folder_reason)
+
+        second = Document(Path("second.pdf"), "health", "common word", "PDF text", lead_text="exercise")
+        close = Document(Path("close.pdf"), "미분류", "no common word", "PDF text", lead_text="mixed")
+        vectors = {"garden.pdf": [1.0, 0.0], "second.pdf": [0.95, 0.31], "close.pdf": [1.0, 0.0]}
+        count = assign_ai_folders(
+            [garden, second, close],
+            lambda texts: [vectors[text.split("\n", 1)[0]] for text in texts],
+        )
+        self.assertEqual(count, 0)
+        self.assertEqual(close.folder, "미분류")
+        self.assertIn("garden", close.folder_reason)
+        self.assertIn("1.00", close.folder_reason)
+        self.assertIn("0.05", close.folder_reason)
+        self.assertIn("후보 간 차이 부족", close.folder_reason)
+
     def test_embedding_failure_does_not_change_any_folder(self):
         garden = Document(Path("garden.pdf"), "텃밭", "공통 단어", "PDF 텍스트", lead_text="식물 재배")
         unknown = Document(Path("scan.pdf"), "미분류", "공통 단어 없음", "PDF 텍스트", lead_text="모종")

@@ -88,6 +88,7 @@ def assign_ai_folders(
 
     # 전부 계산한 뒤에만 반영해야 연결 실패 시 기존 미리보기가 그대로 남는다.
     suggestions = []
+    declined = []
     for doc, vector in zip(unknown, vectors[len(seeds):]):
         scores = sorted(
             ((sum(a * b for a, b in zip(vector, center)), folder) for folder, center in centroids.items()),
@@ -97,11 +98,17 @@ def assign_ai_folders(
         runner_up = scores[1][0] if len(scores) > 1 else -1.0
         if best >= MIN_SIMILARITY and best - runner_up >= MIN_MARGIN:
             suggestions.append((doc, folder, best))
+        else:
+            gap = f"2순위와 차이: {best - runner_up:.2f}" if len(scores) > 1 else "2순위 없음"
+            cause = "유사도 부족" if best < MIN_SIMILARITY else "후보 간 차이 부족"
+            declined.append((doc, f"AI 1순위: {folder} {best:.2f} | {gap} ({cause})"))
 
+    for doc, reason in declined:
+        doc.folder_reason = reason
     for doc, folder, score in suggestions:
         doc.folder = folder
         doc.folder_reason = f"AI 유사 문서: {score:.2f}"
-    changed = {doc.source: doc for doc, _, _ in suggestions}
+    changed = {doc.source: doc for doc in unknown}
     for doc in documents:
         original = changed.get(doc.duplicate_of)
         if original:
