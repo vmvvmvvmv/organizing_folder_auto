@@ -43,10 +43,12 @@ $pyInstallerArgs = @(
     '--add-data', ($notice + ';.'),
     '--add-data', ($apache + ';licenses')
 )
-$ocrFiles = @((Get-Item -LiteralPath (Join-Path $TesseractDir 'tesseract.exe'))) +
-    @(Get-ChildItem -LiteralPath $TesseractDir -Filter '*.dll' -File)
+$ocrFiles = @(& $python (Join-Path $root 'ocr_dependencies.py') $TesseractDir)
+if ($LASTEXITCODE -ne 0 -or $ocrFiles.Count -eq 0) {
+    throw 'Tesseract 의존성 확인에 실패했습니다.'
+}
 foreach ($file in $ocrFiles) {
-    $pyInstallerArgs += @('--add-binary', "$($file.FullName);ocr")
+    $pyInstallerArgs += @('--add-binary', "${file};ocr")
 }
 $pyInstallerArgs += (Join-Path $root 'app.py')
 
