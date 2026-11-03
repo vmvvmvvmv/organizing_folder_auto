@@ -4,7 +4,7 @@ Windows 폴더의 문서를 읽고 비슷한 파일을 폴더별로 정리합니
 
 ## 다운로드
 
-[Download app (Windows)](https://github.com/vmvvmvvmv/organizing_folder_auto/releases/latest/download/DocumentOrganizer.exe)
+[Download app (Windows)](https://github.com/vmvvmvvmv/organizing_folder_auto/releases/download/v1.0.0/DocumentOrganizer.exe)
 
 다운로드한 DocumentOrganizer.exe를 실행하세요.
 
