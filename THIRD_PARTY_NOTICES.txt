@@ -1,0 +1,17 @@
+DocumentOrganizer source: https://github.com/vmvvmvvmv/organizing_folder_auto
+DocumentOrganizer license: GNU AGPL-3.0 (see LICENSE).
+
+Bundled third-party software:
+- PyMuPDF 1.26.3 / MuPDF: GNU AGPL or commercial license.
+  Source: https://github.com/pymupdf/PyMuPDF
+- Tesseract OCR 5.4.0.20240606: Apache-2.0 (see licenses/Apache-2.0.txt).
+  Source: https://github.com/tesseract-ocr/tesseract
+- Korean OCR model from tessdata_fast 4.1.0: Apache-2.0.
+  Source: https://github.com/tesseract-ocr/tessdata_fast/tree/4.1.0
+- CPython 3.11: Python Software Foundation License.
+  Source: https://www.python.org/downloads/release/python-3110/
+- PyInstaller bootloader: GPL-2.0 with a special exception.
+  Source: https://pyinstaller.org/en/stable/license.html
+
+The Tesseract build also contains third-party DLLs. See the upstream project
+and the original build for their respective license and copyright notices.
