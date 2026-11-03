@@ -9,6 +9,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from ai_groups import assign_ai_folders
 from organizer import Document, default_destination, move_documents, rename_folder, scan, valid_folder_name, write_result_report
 from reader import SUPPORTED, find_tesseract, ocr_status
 
@@ -19,6 +20,17 @@ def move_confirmation_text(documents: list[Document]) -> str:
         "이동한 원본과 확인된 중복 원본은 삭제됩니다."
     )
 
+
+
+def ai_preview_note(documents: list[Document], enabled: bool) -> str:
+    if not enabled:
+        return ""
+    try:
+        count = assign_ai_folders(documents)
+        return f"AI 유사 분류 {count}개."
+    except Exception as exc:
+        # AI 호출이 실패해도 원래 분류 결과는 유지한다.
+        return f"AI 분류 실패: {exc}. 기존 분류를 표시합니다."
 
 class OrganizerApp(tk.Tk):
     def __init__(self) -> None:
@@ -43,6 +55,7 @@ class OrganizerApp(tk.Tk):
         self.folder_var = tk.StringVar()
         self.filter_var = tk.StringVar(value="전체")
         self.count_var = tk.StringVar(value="표시 0개")
+        self.ai_var = tk.BooleanVar(value=False)
 
         frame = ttk.Frame(self, padding=14)
         frame.pack(fill="both", expand=True)
@@ -57,9 +70,11 @@ class OrganizerApp(tk.Tk):
         ttk.Entry(frame, textvariable=self.destination_var).grid(row=1, column=1, sticky="ew", padx=8)
         ttk.Button(frame, text="선택", command=self.choose_destination).grid(row=1, column=2)
 
-        ttk.Label(frame, text="원본과 하위 폴더를 검사합니다. 정리할 때 내용을 검증한 뒤 원본 파일을 이동합니다.").grid(
-            row=2, column=0, columnspan=3, sticky="w", pady=(8, 3)
+        ttk.Label(frame, text="하위 폴더까지 검사하고 검증 후 파일을 이동합니다.").grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(8, 3)
         )
+        self.ai_checkbox = ttk.Checkbutton(frame, text="로컬 AI 분류", variable=self.ai_var)
+        self.ai_checkbox.grid(row=2, column=2, sticky="e")
         self.scan_button = ttk.Button(frame, text="분류 미리보기", command=self.start_scan)
         self.scan_button.grid(row=3, column=0, sticky="w", pady=8)
         self.cancel_button = ttk.Button(frame, text="중단", command=self.cancel_current, state="disabled")
@@ -193,6 +208,7 @@ class OrganizerApp(tk.Tk):
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
         self.scan_button.configure(state="disabled" if busy else "normal")
+        self.ai_checkbox.configure(state="disabled" if busy else "normal")
         self.move_button.configure(state="disabled" if busy or not self.documents or self.preview_paths is None else "normal")
         self.cancel_button.configure(state="normal" if busy and not self.cancel_event.is_set() else "disabled")
 
@@ -221,6 +237,7 @@ class OrganizerApp(tk.Tk):
         if not paths:
             return
         source, destination = paths
+        use_ai = self.ai_var.get()
         self.documents = []
         self.preview_paths = None
         self.refresh_table()
@@ -237,7 +254,12 @@ class OrganizerApp(tk.Tk):
                 )
                 if self.cancel_event.is_set():
                     raise InterruptedError("검사가 중단되었습니다")
-                self.events.put(("scanned", documents, paths))
+                if use_ai:
+                    self.events.put(("progress", "로컬 AI로 미분류 문서를 확인하는 중입니다…"))
+                ai_note = ai_preview_note(documents, use_ai)
+                if self.cancel_event.is_set():
+                    raise InterruptedError("검사가 중단되었습니다")
+                self.events.put(("scanned", documents, paths, ai_note))
             except InterruptedError:
                 self.events.put(("cancelled_scan",))
             except Exception as exc:
@@ -299,6 +321,7 @@ class OrganizerApp(tk.Tk):
         if not paths:
             return
         source, destination = paths
+
         # 미리보기와 다른 폴더를 정리하면 화면에 보인 분류가 틀어질 수 있다.
         if self.preview_paths != paths:
             messagebox.showerror("미리보기 확인", "원본 또는 결과 폴더가 바뀌었습니다. 미리보기를 다시 실행하세요")
@@ -356,7 +379,7 @@ class OrganizerApp(tk.Tk):
                         f"{len(self.documents)}개 확인 · 제안 폴더 {folder_count}개 · "
                         f"미분류 {unknown}개 · 읽기 실패 {failed}개 · "
                         f"동일 파일 {duplicates}개 · 파일명 기준 {filename_only}개. "
-                        "분류를 확인한 뒤 정리를 시작하세요."
+                        "분류를 확인한 뒤 정리를 시작하세요." + (f" {event[3]}" if event[3] else "")
                     )
                     self._set_busy(False)
                 elif kind == "cancelled_scan":
