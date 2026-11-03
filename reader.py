@@ -68,9 +68,14 @@ def _office_text(path: Path) -> str:
 
 
 def find_tesseract() -> str | None:
-    bundled = Path(sys.executable).resolve().parent / "ocr" / "tesseract.exe"
-    if bundled.is_file():
-        return str(bundled)
+    roots = []
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        roots.append(Path(sys._MEIPASS))
+    roots.append(Path(sys.executable).resolve().parent)
+    for root in roots:
+        bundled = root / "ocr" / "tesseract.exe"
+        if bundled.is_file():
+            return str(bundled)
     candidate = shutil.which("tesseract")
     if candidate:
         return candidate

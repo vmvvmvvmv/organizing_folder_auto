@@ -45,6 +45,16 @@ class OrganizerTests(unittest.TestCase):
         with mock.patch.object(sys, "executable", str(executable)):
             self.assertEqual(find_tesseract(), str(bundled))
 
+    def test_onefile_app_uses_extracted_tesseract(self):
+        extracted = self.folder / "extracted"
+        bundled = extracted / "ocr" / "tesseract.exe"
+        bundled.parent.mkdir(parents=True)
+        bundled.write_bytes(b"test")
+        executable = self.folder / "DocumentOrganizer.exe"
+        with mock.patch.object(sys, "executable", str(executable)), \
+             mock.patch.object(sys, "frozen", True, create=True), \
+             mock.patch.object(sys, "_MEIPASS", str(extracted), create=True):
+            self.assertEqual(find_tesseract(), str(bundled))
     def test_ocr_runs_without_console_window_or_stdin(self):
         result = mock.Mock(returncode=0, stdout="kor", stderr="")
         with mock.patch("reader.subprocess.run", return_value=result) as run:
