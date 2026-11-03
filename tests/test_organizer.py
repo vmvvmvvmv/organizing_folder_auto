@@ -92,6 +92,21 @@ class OrganizerTests(unittest.TestCase):
         self.assertIn("Official document", text)
         self.assertEqual(method, "PDF 텍스트")
 
+    def test_pdf_font_warning_is_visible_in_read_method(self):
+        try:
+            import pymupdf
+        except ImportError:
+            self.skipTest("PyMuPDF is not installed")
+        path = self.folder / "font-warning.pdf"
+        with pymupdf.open() as pdf:
+            page = pdf.new_page()
+            page.insert_text((50, 50), "Official document with enough text to extract from PDF")
+            pdf.save(path)
+        with mock.patch.object(pymupdf.TOOLS, "mupdf_warnings", return_value="syntax error: unknown cid font type"):
+            text, method = read_document(path, None)
+        self.assertIn("Official document", text)
+        self.assertIn("글꼴 경고", method)
+
     def test_scanned_pdf_renders_page_for_ocr(self):
         try:
             import pymupdf

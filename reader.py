@@ -133,6 +133,10 @@ def _pdf_text(path: Path, executable: str | None) -> tuple[str, str]:
     except ImportError as exc:
         raise RuntimeError("PDF 읽기용 PyMuPDF가 설치되지 않았습니다") from exc
 
+    pymupdf.TOOLS.mupdf_display_errors(False)
+    pymupdf.TOOLS.mupdf_display_warnings(False)
+    pymupdf.TOOLS.reset_mupdf_warnings()
+
     chunks = []
     used_ocr = False
     skipped_ocr = False
@@ -161,6 +165,8 @@ def _pdf_text(path: Path, executable: str | None) -> tuple[str, str]:
     method = "PDF 텍스트 + OCR" if used_ocr else "PDF 텍스트"
     if skipped_ocr:
         method += " (일부 스캔 페이지 미인식)"
+    if "unknown cid font type" in pymupdf.TOOLS.mupdf_warnings().lower():
+        method += " (글꼴 경고)"
     return " ".join(chunks), method
 
 
