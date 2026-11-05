@@ -18,6 +18,10 @@ from classification_rules import is_structured_file, is_type_only, type_folder
 from reader import SUPPORTED, read_document
 
 
+# 미리보기 때 내용을 읽지 못한 파일의 preview_digest. 이런 파일은 옮기지 않는다.
+UNREADABLE = b""
+
+
 def default_destination(source: Path) -> Path:
     return source.parent / f"{source.name}_자동정리결과"
 
@@ -131,8 +135,17 @@ def scan(
         if should_cancel and should_cancel():
             raise InterruptedError("검사가 중단되었습니다")
         # 내용을 못 읽는 파일도 이동 전 검증할 수 있도록 미리보기 시점의 해시를 남긴다.
-        digest = _digest(path)
         structured = is_structured_file(path)
+        try:
+            digest = _digest(path)
+        except OSError as exc:
+            # 다른 프로그램이 잠근 파일 하나 때문에 미리보기 전체를 멈추지 않는다.
+            # 내용을 확인하지 못했으므로 이동 단계에서는 원본에 남긴다.
+            results.append(Document(path, "", "", "", f"파일을 읽을 수 없습니다: {exc}",
+                                    preview_digest=UNREADABLE, preserve_structure=structured))
+            if progress:
+                progress(index, len(files))
+            continue
         try:
             # 같은 내용이면 분류와 OCR도 다시 하지 않는다.
             shareable = not structured
@@ -243,6 +256,8 @@ def _prepare(document: Document, destination: Path, source_root: Path | None) ->
         raise ValueError("사용할 수 없는 결과 파일 이름입니다")
     if not source.is_file() or source.is_symlink() or source.resolve().is_relative_to(destination):
         raise ValueError("원본 파일이 없거나 결과 폴더 안에 있습니다")
+    if document.preview_digest == UNREADABLE:
+        raise ValueError("미리보기 때 읽을 수 없던 파일입니다. 원본을 유지했습니다")
     folder = _target_folder(document, destination, source_root)
     folder.mkdir(parents=True, exist_ok=True)
     digest = _digest(source)
@@ -336,6 +351,8 @@ def move_documents(
         if current != {doc.source.resolve() for doc in documents}:
             raise ValueError("미리보기 이후 파일 목록이 변경되었습니다. 미리보기를 다시 실행하세요")
     for document in previewed:
+        if document.preview_digest == UNREADABLE:
+            continue
         try:
             changed = (not document.source.is_file() or document.source.is_symlink()
                        or _digest(document.source) != document.preview_digest)

@@ -152,7 +152,7 @@ class OrganizerApp(tk.Tk):
         ttk.Entry(frame, textvariable=self.destination_var).grid(row=1, column=1, sticky="ew", padx=8)
         ttk.Button(frame, text="선택", command=self.choose_destination).grid(row=1, column=2)
 
-        self.ai_checkbox = ttk.Checkbutton(frame, text="로컬 AI만 분류", variable=self.ai_var)
+        self.ai_checkbox = ttk.Checkbutton(frame, text="로컬 AI 분류 (규칙 검증 포함)", variable=self.ai_var)
         self.ai_checkbox.grid(row=2, column=2, sticky="e")
         self.scan_button = ttk.Button(frame, text="분류 미리보기", command=self.start_scan)
         self.scan_button.grid(row=3, column=0, sticky="w", pady=8)

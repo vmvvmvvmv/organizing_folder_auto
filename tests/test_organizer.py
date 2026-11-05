@@ -408,6 +408,32 @@ class OrganizerTests(unittest.TestCase):
         self.assertEqual([doc.source.name for doc, _ in errors], ["locked.pdf"])
         self.assertTrue((source / "locked.pdf").exists())
 
+    def test_locked_file_during_preview_is_reported_and_never_moved(self):
+        source = self.folder / "source"
+        destination = self.folder / "result"
+        source.mkdir()
+        destination.mkdir()
+        (source / "locked.xyz").write_bytes(b"locked")
+        (source / "free.xyz").write_bytes(b"free")
+        real_digest = organizer._digest
+        locked = True
+
+        def digest(path):
+            if locked and path.name == "locked.xyz":
+                raise PermissionError(13, "Permission denied")
+            return real_digest(path)
+
+        with mock.patch("organizer._digest", side_effect=digest):
+            documents = scan(source, destination, None)
+        by_name = {doc.source.name: doc for doc in documents}
+        self.assertIn("읽을 수 없습니다", by_name["locked.xyz"].error)
+        self.assertEqual(by_name["free.xyz"].error, "")
+        locked = False  # 미리보기 뒤 잠금이 풀려도 확인하지 못한 파일은 옮기지 않는다
+        moved, deduplicated, errors = move_documents(documents, destination, source_root=source)
+        self.assertEqual([doc.source.name for doc, _ in moved], ["free.xyz"])
+        self.assertEqual([doc.source.name for doc, _ in errors], ["locked.xyz"])
+        self.assertTrue((source / "locked.xyz").exists())
+
     def test_scan_can_stop_between_files(self):
         source = self.folder / "source"
         source.mkdir()
