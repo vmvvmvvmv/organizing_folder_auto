@@ -364,15 +364,23 @@ def move_documents(
     moved: list[tuple[Document, Path]] = []
     deduplicated: list[tuple[Document, Path]] = []
     errors: list[tuple[Document, str]] = []
-    existing = {}
-    for path in sorted(destination.rglob("*")):
-        if should_cancel and should_cancel():
-            return moved, deduplicated, errors
-        if path.is_file() and not path.is_symlink() and not is_structured_file(path):
-            try:
-                existing[_digest(path)] = path
-            except OSError:
-                continue
+    # 이번 실행에서 옮긴 파일은 폴더와 관계없이 같은 내용을 한 번만 남긴다(미리보기의 '중복' 표시와 같다).
+    # 실행 전부터 결과 폴더에 있던 파일은 미리보기에 보이지 않았으므로, 지정한 폴더 안에 있을 때만 중복으로 본다.
+    moved_by_digest: dict[bytes, Path] = {}
+    folder_files: dict[Path, dict[bytes, Path]] = {}
+
+    def existing_in(folder: Path) -> dict[bytes, Path]:
+        if folder not in folder_files:
+            index: dict[bytes, Path] = {}
+            for path in sorted(folder.iterdir()):
+                if (path.is_file() and not path.is_symlink() and path.suffix != ".partial"
+                        and not is_structured_file(path)):
+                    try:
+                        index.setdefault(_digest(path), path)
+                    except OSError:
+                        continue
+            folder_files[folder] = index
+        return folder_files[folder]
 
     # GIS/프로그램 구성 파일은 원래 같은 폴더에 있던 묶음을 다른 결과 경로로 나누지 않는다.
     structured_routes: dict[tuple[Path, str], set[tuple[str, str]]] = {}
@@ -416,7 +424,7 @@ def move_documents(
         try:
             source = document.source
             folder, digest = _prepare(document, destination, source_root)
-            matched = existing.get(digest)
+            matched = moved_by_digest.get(digest) or existing_in(folder).get(digest)
             if matched is not None:
                 # 기존 결과 파일이나 이번 실행에서 옮긴 파일도 다시 읽고 확인한다.
                 if _digest(source) != digest or _digest(matched) != digest:
@@ -439,7 +447,7 @@ def move_documents(
                 target.unlink(missing_ok=True)
                 raise ValueError("이동 후 내용 검증 실패: 원본을 유지했습니다")
             # 원본 삭제에 실패하면 검증된 결과 파일과 원본을 모두 남긴다.
-            existing[digest] = target
+            moved_by_digest[digest] = target
             source.unlink()
             finish(document, "이동", target)
         except (OSError, ValueError) as exc:

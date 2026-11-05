@@ -268,12 +268,25 @@ class OrganizerTests(unittest.TestCase):
         source.write_bytes(b"same document")
         destination = self.folder / "result"
         destination.mkdir()
-        existing = destination / "already.pdf"
+        (destination / "자료").mkdir()
+        existing = destination / "자료" / "already.pdf"
         existing.write_bytes(source.read_bytes())
         moved, deduplicated, errors = move_documents([Document(source, "자료", "", "")], destination)
         self.assertEqual((len(moved), len(deduplicated), len(errors)), (0, 1, 0))
         self.assertEqual(deduplicated[0][1], existing)
         self.assertFalse(source.exists())
+
+    def test_existing_identical_file_in_other_folder_does_not_remove_source(self):
+        source = self.folder / "source.pdf"
+        source.write_bytes(b"same document")
+        destination = self.folder / "result"
+        (destination / "사진").mkdir(parents=True)
+        (destination / "사진" / "old.pdf").write_bytes(source.read_bytes())
+        moved, deduplicated, errors = move_documents([Document(source, "자료", "", "")], destination)
+        # 미리보기에서 고른 '자료' 폴더에 실제로 파일이 생겨야 한다.
+        self.assertEqual((len(moved), len(deduplicated), len(errors)), (1, 0, 0))
+        self.assertEqual(moved[0][1], destination / "자료" / "source.pdf")
+        self.assertTrue((destination / "사진" / "old.pdf").exists())
 
     def test_failure_to_remove_original_keeps_both_verified_files(self):
         source = self.folder / "source.pdf"
