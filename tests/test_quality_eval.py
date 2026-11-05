@@ -36,16 +36,16 @@ class QualityEvalTests(unittest.TestCase):
             with mock.patch("ai_groups.ollama_classify", return_value=[("출장", "이유")]) as chat, \
                     mock.patch("ai_groups.ollama_embeddings",
                                side_effect=ai_groups.IncompleteResultError("누락")) as embed:
-                embed_first, classify, _subdivide, save = cached_ollama(cache)
+                calls, save = cached_ollama(cache)
                 with self.assertRaises(ai_groups.IncompleteResultError):
-                    embed_first(["본문"])
-                self.assertEqual(classify(items, []), [("출장", "이유")])
+                    calls["embed"](["본문"])
+                self.assertEqual(calls["classify"](items, []), [("출장", "이유")])
                 save()
                 # 새로 읽은 캐시는 Ollama를 부르지 않고 같은 응답과 오류를 돌려준다.
-                embed_again, classify_again, _, _ = cached_ollama(cache)
-                self.assertEqual(classify_again(items, []), [("출장", "이유")])
+                again, _ = cached_ollama(cache)
+                self.assertEqual(again["classify"](items, []), [("출장", "이유")])
                 with self.assertRaises(ai_groups.IncompleteResultError):
-                    embed_again(["본문"])
+                    again["embed"](["본문"])
             self.assertEqual((chat.call_count, embed.call_count), (1, 1))
             # 앱과 같은 AI 전용 지시문을 쓴다.
             self.assertEqual(chat.call_args.kwargs["instructions_override"],

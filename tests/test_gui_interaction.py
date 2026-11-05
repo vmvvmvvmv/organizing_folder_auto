@@ -84,6 +84,36 @@ class GuiInteractionTests(unittest.TestCase):
         self.app.update()
         self.assertFalse(self.app.rename_entry.winfo_ismapped())
 
+    def test_undo_button_restores_files_from_chosen_report(self):
+        import tempfile
+        import time
+        from organizer import ResultReport, move_documents, scan
+
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "source"
+            destination = Path(folder) / "result"
+            (source / "a").mkdir(parents=True)
+            destination.mkdir()
+            (source / "a" / "메모.xyz").write_bytes(b"memo")
+            documents = scan(source, destination, None)
+            documents[0].folder = "자료"
+            with ResultReport(source, destination, documents) as report:
+                move_documents(documents, destination, source_root=source, record=report.record)
+            self.assertFalse((source / "a" / "메모.xyz").exists())
+            with mock.patch("app.filedialog.askopenfilename", return_value=str(report.path)), \
+                    mock.patch.object(messagebox, "askyesno", return_value=True) as ask, \
+                    mock.patch.object(messagebox, "showinfo") as done:
+                self.app.start_undo()
+                deadline = time.monotonic() + 10
+                while self.app.busy and time.monotonic() < deadline:
+                    self.app.update()
+                    time.sleep(0.05)
+                self.app.update()
+            self.assertIn("1개 파일", ask.call_args.args[1])
+            done.assert_called_once()
+            self.assertEqual((source / "a" / "메모.xyz").read_bytes(), b"memo")
+            self.assertIn("1개 복원", self.app.status_var.get())
+
     def rename_folder_to(self, old, new, answer):
         row = next(item for item, route in self.app.folder_rows.items() if route == (old, None))
         with mock.patch.object(messagebox, "askyesno", return_value=answer) as ask:

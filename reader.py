@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import os
 import re
 import shutil
@@ -12,7 +13,9 @@ import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
-SUPPORTED = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".docx", ".hwpx", ".xlsx", ".pptx"}
+TEXT_TYPES = {".txt", ".md", ".csv", ".tsv"}
+SUPPORTED = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".docx", ".hwpx", ".xlsx", ".pptx",
+             *TEXT_TYPES}
 IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 MAX_FILE_BYTES = 100 * 1024 * 1024
 LOCAL_TESSDATA = Path(__file__).resolve().parent / "models"
@@ -65,6 +68,25 @@ def _office_text(path: Path) -> str:
                 raise ValueError("문서 본문이 너무 큽니다")
             chunks.append(_xml_text(archive.read(name)))
         return " ".join(chunks)
+
+
+def _plain_text(path: Path) -> str:
+    """메모장·마크다운·CSV의 앞부분을 읽는다. UTF-8을 먼저 보고, 아니면 한국어 Windows 기본(CP949)으로 읽는다."""
+    with path.open("rb") as stream:
+        data = stream.read(64 * 1024)
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        encodings = ["utf-16"]
+    elif b"\x00" in data:
+        raise ValueError("텍스트 파일이 아닙니다")
+    else:
+        encodings = ["utf-8-sig", "cp949"]
+    for encoding in encodings:
+        try:
+            # 64KB 경계에서 잘린 마지막 글자는 무시하도록 이어 읽기 디코더를 쓴다.
+            return codecs.getincrementaldecoder(encoding)().decode(data, final=False)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
 
 
 def find_tesseract() -> str | None:
@@ -181,6 +203,8 @@ def read_document(path: Path, executable: str | None) -> tuple[str, str]:
             return _pdf_text(path, executable)
         if suffix in IMAGE_TYPES:
             return _ocr_image(path, executable), "이미지 OCR"
+        if suffix in TEXT_TYPES:
+            return _plain_text(path), "텍스트 파일"
     except (zipfile.BadZipFile, ET.ParseError, subprocess.SubprocessError) as exc:
         raise RuntimeError(str(exc)) from exc
     raise ValueError("지원하지 않는 형식입니다")

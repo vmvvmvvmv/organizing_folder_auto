@@ -11,7 +11,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from ai_groups import assign_ai_folders
-from organizer import Document, default_destination, move_documents, reassign_documents, rename_document, rename_folder, rename_subfolder, scan, valid_folder_name, ResultReport
+from organizer import Document, default_destination, move_documents, reassign_documents, rename_document, rename_folder, rename_subfolder, scan, source_files, undo_jobs, undo_report, valid_folder_name, ResultReport
 from reader import IMAGE_TYPES, MAX_FILE_BYTES, SUPPORTED, find_tesseract, ocr_status
 
 CONFIRM_BEFORE_OPEN = {
@@ -161,8 +161,12 @@ class OrganizerApp(tk.Tk):
         self.scan_button.grid(row=3, column=0, sticky="w", pady=8)
         self.cancel_button = ttk.Button(frame, text="중단", command=self.cancel_current, state="disabled")
         self.cancel_button.grid(row=3, column=1, sticky="w", pady=8, padx=8)
-        self.open_button = ttk.Button(frame, text="결과 폴더 열기", command=self.open_result, state="disabled")
-        self.open_button.grid(row=3, column=1, sticky="e", pady=8, padx=8)
+        result_buttons = ttk.Frame(frame)
+        result_buttons.grid(row=3, column=1, sticky="e", pady=8, padx=8)
+        self.undo_button = ttk.Button(result_buttons, text="정리 되돌리기…", command=self.start_undo)
+        self.undo_button.pack(side="left", padx=(0, 6))
+        self.open_button = ttk.Button(result_buttons, text="결과 폴더 열기", command=self.open_result, state="disabled")
+        self.open_button.pack(side="left")
         self.move_button = ttk.Button(frame, text="정리 시작", command=self.start_move, state="disabled")
         self.move_button.grid(row=3, column=2, sticky="e", pady=8)
 
@@ -360,6 +364,7 @@ class OrganizerApp(tk.Tk):
         self.busy = busy
         self.scan_button.configure(state="disabled" if busy else "normal")
         self.ai_checkbox.configure(state="disabled" if busy else "normal")
+        self.undo_button.configure(state="disabled" if busy else "normal")
         self.move_button.configure(state="disabled" if busy or not self.documents or self.preview_paths is None else "normal")
         self.cancel_button.configure(state="normal" if busy and not self.cancel_event.is_set() else "disabled")
 
@@ -417,6 +422,12 @@ class OrganizerApp(tk.Tk):
                 )
                 if self.cancel_event.is_set():
                     raise InterruptedError("검사가 중단되었습니다")
+                projects = source_files(source, destination)[1]
+                if projects:
+                    names = ", ".join(project.name for project in projects[:3])
+                    more = f" 외 {len(projects) - 3}개" if len(projects) > 3 else ""
+                    ai_note = (f"코드 프로젝트·압축 푼 문서 폴더 {len(projects)}개({names}{more})는 그대로 둡니다. "
+                               + ai_note)
                 self.events.put(("scanned", documents, paths, ai_note))
             except InterruptedError:
                 self.events.put(("cancelled_scan",))
@@ -870,6 +881,51 @@ class OrganizerApp(tk.Tk):
                 body.insert("end", "\n내용 미리보기가 없는 파일입니다. 원본 위치에서 확인하세요.\n")
         body.configure(state="disabled")
 
+    def start_undo(self) -> None:
+        """정리 결과 기록(CSV)을 골라 그 정리를 되돌린다."""
+        if self.busy:
+            return
+        initial = self.last_result_dir or (
+            Path(self.destination_var.get().strip()) if self.destination_var.get().strip() else None)
+        path = filedialog.askopenfilename(
+            title="되돌릴 정리 결과 기록(CSV) 선택",
+            initialdir=str(initial) if initial and initial.is_dir() else None,
+            filetypes=[("정리 결과 기록", "정리_결과_*.csv"), ("CSV 파일", "*.csv")],
+        )
+        if not path:
+            return
+        report = Path(path)
+        try:
+            jobs = undo_jobs(report)
+        except (OSError, ValueError, KeyError) as exc:
+            messagebox.showerror("정리 되돌리기", f"기록을 읽을 수 없습니다: {exc}")
+            return
+        if not jobs:
+            messagebox.showinfo("정리 되돌리기", "이 기록에는 되돌릴 파일이 없습니다")
+            return
+        if not messagebox.askyesno(
+            "정리 되돌리기",
+            f"{len(jobs)}개 파일을 정리 전 위치로 되돌릴까요?\n"
+            "원래 위치에 같은 이름의 파일이 새로 생겼으면 그 파일은 건너뜁니다.",
+        ):
+            return
+        self.cancel_event.clear()
+        self._set_busy(True)
+        self.status_var.set("파일을 원래 위치로 되돌리는 중입니다…")
+
+        def work() -> None:
+            try:
+                restored, errors = undo_report(
+                    report,
+                    lambda done, total: self.events.put(("progress", f"되돌리는 중: {done}/{total}")),
+                    should_cancel=self.cancel_event.is_set,
+                )
+                self.events.put(("undone", restored, errors, len(jobs)))
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+
+        threading.Thread(target=work, daemon=False).start()
+
     def start_move(self) -> None:
         if self.busy or not self.documents:
             return
@@ -958,6 +1014,28 @@ class OrganizerApp(tk.Tk):
                         messagebox.showinfo(
                             "정리 결과", f"{len(moved)}개 이동, 중복 원본 {len(deduplicated)}개 정리.\n{destination}"
                         )
+                elif kind == "undone":
+                    restored, errors, total = event[1:]
+                    # 파일 위치가 바뀌었으므로 예전 미리보기로는 정리할 수 없다.
+                    self.documents = []
+                    self.preview_paths = None
+                    self.refresh_table()
+                    skipped = total - len(restored) - len(errors)
+                    self.status_var.set(
+                        f"되돌리기: {len(restored)}개 복원 · 실패 {len(errors)}개"
+                        + (f" · 중단으로 미처리 {skipped}개" if skipped else "")
+                    )
+                    self._set_busy(False)
+                    if self.close_requested:
+                        continue
+                    if errors or skipped:
+                        detail = "\n".join(f"{path.name}: {error}" for path, error in errors[:8])
+                        messagebox.showwarning(
+                            "되돌리기 결과",
+                            f"{len(restored)}개를 원래 위치로 되돌렸습니다. 실패 {len(errors)}개, 미처리 {skipped}개.\n{detail}",
+                        )
+                    else:
+                        messagebox.showinfo("되돌리기 결과", f"{len(restored)}개를 모두 원래 위치로 되돌렸습니다.")
                 elif kind == "error":
                     self.status_var.set(event[1])
                     self.preview_paths = None

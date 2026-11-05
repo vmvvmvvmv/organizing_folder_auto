@@ -8,6 +8,7 @@ from ai_groups import (
     EMBED_MODEL, MODEL, ContextSizeError, IncompleteResultError,
     assign_ai_folders, ollama_classify, ollama_embeddings,
 )
+import ai_groups
 from app import ai_preview_note
 from organizer import Document, scan
 
@@ -351,6 +352,22 @@ class AiGroupTests(unittest.TestCase):
         self.assertEqual(matches["출장 관리"], ("출장 결과", 0.6))
         self.assertEqual(matches["예비군 교육"], ("출장 결과", 0.0))
 
+    def test_folders_merge_only_with_shared_name_word_and_similar_content(self):
+        from ai_groups import _consolidated_names, _consolidation_pairs
+        names = ["대기시간 조회 시스템"] * 3 + ["대기시간 예측"] * 2 + ["대기시간 이미지", "요금제 기획"]
+        vectors = [[1.0, 0.0, 0.0]] * 3 + [[0.9, 0.1, 0.0]] * 2 + [[0.0, 0.0, 1.0], [0.95, 0.05, 0.0]]
+        docs = [Document(Path(f"{index}.pdf"), "", "", "") for index in range(len(names))]
+        proposals = [(doc, name, "") for doc, name in zip(docs, names)]
+        pairs = _consolidation_pairs(proposals, {doc.source: v for doc, v in zip(docs, vectors)}, set())
+        # '요금제 기획'은 내용이 비슷해도 이름에 같은 단어가 없어 후보가 아니다.
+        self.assertEqual({(left, right) for _, left, right in pairs}, {
+            ("대기시간 예측", "대기시간 이미지"), ("대기시간 예측", "대기시간 조회 시스템"),
+            ("대기시간 이미지", "대기시간 조회 시스템"),
+        })
+        accepted = [(left, right) for score, left, right in pairs if score >= 0.75]
+        # 내용이 다른 '대기시간 이미지'는 남고, 작은 폴더가 큰 폴더 이름으로 합쳐진다.
+        self.assertEqual(_consolidated_names(proposals, accepted), {"대기시간 예측": "대기시간 조회 시스템"})
+
     def test_ai_only_merges_only_close_small_folders(self):
         docs = [Document(Path(f"{name}.pdf"), "미분류", "", "PDF 텍스트", lead_text=name)
                 for name in ("출장 1", "출장 2", "출장 3", "출장 관리", "예비군")]
@@ -368,6 +385,48 @@ class AiGroupTests(unittest.TestCase):
             )
         self.assertEqual([doc.folder for doc in docs], ["출장"] * 4 + ["예비군"])
         self.assertIn("작은 폴더 병합: 출장 관리", docs[3].folder_reason)
+
+    def test_unplaced_images_stay_together_by_original_folder(self):
+        docs = [
+            Document(Path("root/매장사진/IMG_1.jpg"), "미분류", "", "이미지 OCR"),
+            Document(Path("root/매장사진/IMG_2.jpg"), "미분류", "", "이미지 OCR"),
+            Document(Path("root/외톨이/IMG_3.png"), "미분류", "", "이미지 OCR"),
+            Document(Path("root/screen.png"), "미분류", "", "이미지 OCR"),
+            Document(Path("root/출장 사진.jpg"), "미분류", "", "이미지 OCR"),
+        ]
+        assign_ai_folders(
+            docs, ai_only=True,
+            embed=lambda texts: [[float(i == j) for j in range(5)] for i in range(len(texts))],
+            classify=lambda items, known: [
+                ("출장", "파일명") if "출장" in item["documents"][0]["name"] else ("미분류", "단서 없음")
+                for item in items
+            ],
+            subdivide=lambda items, parent: [("", "") for _ in items],
+        )
+        self.assertEqual([(doc.folder, doc.subfolder) for doc in docs], [
+            ("사진·이미지", "매장사진"), ("사진·이미지", "매장사진"),  # 원래 함께 있던 사진
+            ("사진·이미지", ""),  # 혼자 있던 사진은 하위 폴더를 만들지 않는다
+            ("사진·이미지", ""),  # 원본 폴더 바로 아래 사진
+            ("출장", ""),  # 근거가 있으면 주제 폴더
+        ])
+        self.assertIn("원래 폴더 유지", docs[0].folder_reason)
+
+    def test_ai_only_puts_unlabelled_videos_in_type_folder(self):
+        docs = [
+            Document(Path("Cap_triggers_ball_roll_1080p.mp4"), "미분류", "", "파일명·형식"),
+            Document(Path("출장 영상.mp4"), "미분류", "", "파일명·형식"),
+        ]
+        assign_ai_folders(
+            docs, ai_only=True, embed=lambda texts: [[1.0, 0.0], [0.0, 1.0]],
+            classify=lambda items, known: [
+                ("출장", "파일명") if "출장" in item["documents"][0]["name"] else ("영상 제작", "근거 없음")
+                for item in items
+            ],
+            subdivide=lambda items, parent: [("", "") for _ in items],
+        )
+        # 근거가 있는 영상은 주제 폴더, 없는 영상은 미분류 대신 형식 폴더에 둔다.
+        self.assertEqual([doc.folder for doc in docs], ["동영상", "출장"])
+        self.assertIn("파일 형식", docs[0].folder_reason)
 
     def test_ai_only_keeps_topic_folder_for_gis_components(self):
         docs = [
@@ -410,7 +469,8 @@ class AiGroupTests(unittest.TestCase):
             classify=lambda items, known: [("GIS 자료", "공간 정보") for _ in items],
             subdivide=lambda items, parent: [("", "") for _ in items],
         )
-        self.assertEqual([doc.folder for doc in docs], ["GIS 자료", "미분류"])
+        # 글자 없는 이미지는 GIS 자료가 아니라 사진 폴더로 간다.
+        self.assertEqual([doc.folder for doc in docs], ["GIS 자료", "사진·이미지"])
 
     def test_ai_only_rejects_parent_folder_copy_for_gis_files(self):
         doc = Document(Path("maps/area.geojson"), "미분류", "AI 대기", "파일명·형식")

@@ -67,6 +67,21 @@ class OrganizerTests(unittest.TestCase):
                 for call in run.call_args_list
             ))
 
+    def test_plain_text_files_are_read_in_common_korean_encodings(self):
+        samples = {
+            "memo.txt": "출장 결과 메모".encode("utf-8"),
+            "notes.md": "# 회의록\n안건".encode("cp949"),
+            "table.csv": "지역,인구\n장유,1000".encode("utf-16"),
+        }
+        for name, data in samples.items():
+            (self.folder / name).write_bytes(data)
+        self.assertEqual(read_document(self.folder / "memo.txt", None), ("출장 결과 메모", "텍스트 파일"))
+        self.assertIn("회의록", read_document(self.folder / "notes.md", None)[0])
+        self.assertIn("장유", read_document(self.folder / "table.csv", None)[0])
+        (self.folder / "binary.txt").write_bytes(b"MZ\x00\x01\x02")
+        with self.assertRaises(ValueError):
+            read_document(self.folder / "binary.txt", None)
+
     def test_xlsx_and_pptx_text(self):
         xlsx = self.folder / "sample.xlsx"
         pptx = self.folder / "sample.pptx"
@@ -353,6 +368,61 @@ class OrganizerTests(unittest.TestCase):
             rows = list(csv.DictReader(stream))
         self.assertEqual([row["상태"] for row in rows], ["이동", "미처리", "미처리"])
 
+    def organize(self, files):
+        source = self.folder / "source"
+        destination = self.folder / "result"
+        destination.mkdir()
+        for name, data in files.items():
+            path = source / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        documents = scan(source, destination, None)
+        for doc in documents:
+            if not doc.preserve_structure:
+                doc.folder = "자료"
+        with organizer.ResultReport(source, destination, documents) as report:
+            move_documents(documents, destination, source_root=source, record=report.record)
+        return source, destination, report.path
+
+    def test_undo_restores_moved_duplicate_and_gis_files_to_original_places(self):
+        files = {"a/보고서.xyz": b"report", "b/사본.xyz": b"report", "c/메모.xyz": b"memo",
+                 "maps/area.shp": b"shape", "maps/area.shx": b"index"}
+        source, destination, report = self.organize(files)
+        self.assertFalse(any(path.is_file() for path in source.rglob("*")))
+        restored, errors = organizer.undo_report(report)
+        self.assertEqual((len(restored), errors), (5, []))
+        for name, data in files.items():
+            self.assertEqual((source / name).read_bytes(), data)
+        # 결과 폴더에는 기록 파일만 남고 비워진 하위 폴더는 지워진다.
+        self.assertEqual([path.name for path in destination.iterdir()], [report.name])
+
+    def test_undo_skips_file_whose_original_place_is_taken_again(self):
+        source, destination, report = self.organize({"메모.xyz": b"memo", "표.xyz": b"table"})
+        (source / "메모.xyz").write_bytes(b"new file created later")
+        restored, errors = organizer.undo_report(report)
+        self.assertEqual([original.name for _, original in restored], ["표.xyz"])
+        self.assertIn("이미 있어", errors[0][1])
+        self.assertEqual((source / "메모.xyz").read_bytes(), b"new file created later")
+        self.assertTrue((destination / "자료" / "메모.xyz").exists())
+
+    def test_undo_refuses_paths_outside_the_report_folder(self):
+        source, destination, report = self.organize({"메모.xyz": b"memo"})
+        outside = self.folder / "outside.xyz"
+        outside.write_bytes(b"not part of the result")
+        text = report.read_text(encoding="utf-8-sig")
+        report.write_text(text.replace(str(destination / "자료" / "메모.xyz"), str(outside)),
+                          encoding="utf-8-sig")
+        restored, errors = organizer.undo_report(report)
+        self.assertEqual(restored, [])
+        self.assertIn("결과 폴더와 맞지 않습니다", errors[0][1])
+        self.assertTrue(outside.exists())
+
+    def test_undo_explains_old_reports_without_original_paths(self):
+        report = self.folder / "정리_결과_old.csv"
+        report.write_text("원본,폴더,상태,결과 파일\na.pdf,자료,이동,x\n", encoding="utf-8-sig")
+        with self.assertRaisesRegex(ValueError, "원래 위치 정보"):
+            organizer.undo_report(report)
+
     def test_report_keeps_finished_rows_when_move_crashes(self):
         source = self.folder / "source"
         destination = self.folder / "result"
@@ -446,6 +516,35 @@ class OrganizerTests(unittest.TestCase):
         self.assertEqual([doc.source.name for doc, _ in moved], ["free.xyz"])
         self.assertEqual([doc.source.name for doc, _ in errors], ["locked.xyz"])
         self.assertTrue((source / "locked.xyz").exists())
+
+    def test_code_projects_and_tool_folders_are_left_untouched(self):
+        source = self.folder / "source"
+        destination = self.folder / "result"
+        destination.mkdir()
+        for name in ("메모.xyz", "web/package.json", "web/src/app.js", "tool/.git/HEAD",
+                     "tool/main.py", "docs/node_modules/lib/index.js", "docs/보고.xyz"):
+            path = source / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(name.encode())
+        files, projects = organizer.source_files(source, destination)
+        self.assertEqual([path.relative_to(source).as_posix() for path in files],
+                         ["docs/보고.xyz", "메모.xyz"])
+        self.assertEqual(sorted(path.name for path in projects), ["tool", "web"])
+        documents = scan(source, destination, None)
+        self.assertEqual(len(documents), 2)
+        # 프로젝트 안 파일이 바뀌어도 미리보기와 비교할 목록에 들어가지 않는다.
+        (source / "web" / "src" / "new.js").write_bytes(b"new")
+        moved, _, errors = move_documents(documents, destination, source_root=source)
+        self.assertEqual((len(moved), len(errors)), (2, 0))
+        self.assertTrue((source / "web" / "src" / "app.js").exists())
+        self.assertTrue((source / "docs" / "node_modules" / "lib" / "index.js").exists())
+
+    def test_choosing_a_code_project_itself_is_refused(self):
+        source = self.folder / "project"
+        source.mkdir()
+        (source / "package.json").write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "코드 프로젝트"):
+            scan(source, self.folder / "result", None)
 
     def test_scan_can_stop_between_files(self):
         source = self.folder / "source"

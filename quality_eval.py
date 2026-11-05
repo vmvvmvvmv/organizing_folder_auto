@@ -57,8 +57,11 @@ def score_labels(expected: list[str], predicted: list[str]) -> dict:
     }
 
 
-def cached_ollama(cache_file: Path) -> tuple[Callable, Callable, Callable, Callable[[], None]]:
-    """앱과 같은 Ollama 호출을 하되 같은 요청은 저장된 응답(오류 포함)을 다시 쓴다."""
+def cached_ollama(cache_file: Path) -> tuple[dict[str, Callable], Callable[[], None]]:
+    """앱과 같은 Ollama 호출을 하되 같은 요청은 저장된 응답(오류 포함)을 다시 쓴다.
+
+    assign_ai_folders(**calls)에 그대로 넘길 함수 묶음과 캐시 저장 함수를 돌려준다.
+    """
     cache = json.loads(cache_file.read_text(encoding="utf-8")) if cache_file.exists() else {}
 
     def cached(kind: str, payload: object, call: Callable[[], list]) -> list:
@@ -88,7 +91,8 @@ def cached_ollama(cache_file: Path) -> tuple[Callable, Callable, Callable, Calla
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         cache_file.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
 
-    return embed, classify, subdivide, save
+    calls = {"embed": embed, "classify": classify, "subdivide": subdivide}
+    return calls, save
 
 
 def load_documents(source: Path, documents_file: Path) -> list[Document]:
@@ -136,10 +140,10 @@ def evaluate(
                 raise ValueError(f"평가 파일이 변경되었습니다: {row['relative_path']}")
             labels[labels_file.name][relative] = row["expected_folder"]
 
-    calls = {}
+    calls: dict[str, Callable] = {}
     save = None
     if cache_file:
-        calls["embed"], calls["classify"], calls["subdivide"], save = cached_ollama(cache_file)
+        calls, save = cached_ollama(cache_file)
     try:
         assign_ai_folders(documents, ai_only=True, **calls)
     finally:
@@ -159,6 +163,7 @@ def evaluate(
                                        for doc in documents),
         "retried": sum("재판정" in doc.folder_reason for doc in documents),
         "merged_small_folders": sum("작은 폴더 병합" in doc.folder_reason for doc in documents),
+        "consolidated": sum("폴더 통합" in doc.folder_reason for doc in documents),
         "read_failures": sum(bool(doc.error) for doc in documents),
     }
     for name, expected in labels.items():

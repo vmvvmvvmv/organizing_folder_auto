@@ -112,6 +112,45 @@ def rename_subfolder(documents: list[Document], folder: str, old_name: str, new_
             changed.append(index)
     return changed
 
+# 개발 도구가 만드는 폴더. 문서가 아니고 수만 개 파일이 들어 있을 수 있다.
+TOOL_FOLDERS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".next", ".gradle",
+                ".idea", ".vs", ".mypy_cache", ".pytest_cache", ".tox"}
+# 이 파일이 있는 폴더는 코드 프로젝트나 압축을 푼 Office 문서([Content_Types].xml)로 본다.
+# 파일을 낱개로 옮기면 망가지므로 폴더째 그대로 둔다.
+PROJECT_MARKERS = {".git", "package.json", "pyproject.toml", "setup.py", "Cargo.toml", "go.mod",
+                   "pom.xml", "build.gradle", "build.gradle.kts", "[Content_Types].xml"}
+
+
+def _is_code_project(names: list[str]) -> bool:
+    return any(name in PROJECT_MARKERS or name.casefold().endswith(".sln") for name in names)
+
+
+def source_files(source: Path, destination: Path) -> tuple[list[Path], list[Path]]:
+    """정리할 파일과 건드리지 않을 코드 프로젝트 폴더를 돌려준다. 미리보기와 이동 검사가 함께 쓴다."""
+    source = source.resolve()
+    destination = destination.resolve()
+    if _is_code_project(os.listdir(source)):
+        raise ValueError("선택한 폴더가 코드 프로젝트(또는 압축을 푼 문서)입니다. 그 상위 폴더를 선택하세요")
+    files: list[Path] = []
+    projects: list[Path] = []
+    for current, folders, names in os.walk(source):
+        here = Path(current)
+        if here != source and _is_code_project(folders + names):
+            projects.append(here)
+            folders[:] = []
+            continue
+        folders[:] = sorted(
+            name for name in folders
+            if name not in TOOL_FOLDERS and not (here / name).resolve().is_relative_to(destination)
+        )
+        files.extend(
+            path for name in names
+            if (path := here / name).is_file() and not path.is_symlink()
+            and not path.resolve().is_relative_to(destination)
+        )
+    return sorted(files), projects
+
+
 def scan(
     source: Path, destination: Path, executable: str | None,
     progress: Callable[[int, int], None] | None = None,
@@ -124,11 +163,7 @@ def scan(
         raise ValueError("원본 폴더가 없습니다")
     if source == destination or source.is_relative_to(destination):
         raise ValueError("결과 폴더가 원본 폴더와 같거나 원본 폴더를 포함합니다")
-    files = sorted(
-        path for path in source.rglob("*")
-        if path.is_file() and not path.is_symlink()
-        and not path.resolve().is_relative_to(destination)
-    )
+    files, _ = source_files(source, destination)
     results = []
     seen: dict[bytes, Document] = {}
     for index, path in enumerate(files, 1):
@@ -343,11 +378,7 @@ def move_documents(
         raise ValueError("결과 폴더가 없습니다")
     previewed = [doc for doc in documents if doc.preview_digest is not None]
     if source_root and len(previewed) == len(documents):
-        current = {
-            path.resolve() for path in source_root.rglob("*")
-            if path.is_file() and not path.is_symlink()
-            and not path.resolve().is_relative_to(destination)
-        }
+        current = {path.resolve() for path in source_files(source_root, destination)[0]}
         if current != {doc.source.resolve() for doc in documents}:
             raise ValueError("미리보기 이후 파일 목록이 변경되었습니다. 미리보기를 다시 실행하세요")
     for document in previewed:
@@ -472,7 +503,9 @@ class ResultReport:
             except FileExistsError:
                 number += 1
         self.writer = csv.writer(self.stream)
-        self._write(("원본", "폴더", "상태", "결과 파일", "분류 조건", "읽기 방식", "읽기 오류", "이동 오류"))
+        # '원본 경로'는 되돌리기(undo_report)가 원래 위치를 찾는 데 쓴다.
+        self._write(("원본", "폴더", "상태", "결과 파일", "분류 조건", "읽기 방식", "읽기 오류", "이동 오류",
+                     "원본 경로"))
 
     def _write(self, row: tuple[str, ...]) -> None:
         self.writer.writerow(row)
@@ -485,7 +518,7 @@ class ResultReport:
         self._write((
             str(doc.source.relative_to(self.source)),
             f"{doc.folder}/{doc.subfolder}" if doc.subfolder else doc.folder, status,
-            result, doc.folder_reason, doc.method, doc.error, error,
+            result, doc.folder_reason, doc.method, doc.error, error, str(doc.source.absolute()),
         ))
 
     def close(self) -> None:
@@ -504,3 +537,69 @@ class ResultReport:
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
+
+
+def undo_jobs(report: Path) -> list[tuple[str, Path, Path]]:
+    """정리 결과 기록에서 되돌릴 (상태, 결과 파일, 원래 위치) 목록을 읽는다."""
+    with report.open(encoding="utf-8-sig", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    if not rows or "원본 경로" not in rows[0]:
+        raise ValueError("이 기록에는 원래 위치 정보가 없어 되돌릴 수 없습니다")
+    jobs = [(row["상태"], Path(row["결과 파일"]), Path(row["원본 경로"]))
+            for row in rows if row["상태"] in {"이동", "중복 정리"}]
+    # 중복 정리된 원본은 남겨 둔 사본을 복사해 되살리므로, 그 사본이 되돌아가기 전에 먼저 처리한다.
+    return sorted(jobs, key=lambda job: job[0] != "중복 정리")
+
+
+def undo_report(
+    report: Path,
+    progress: Callable[[int, int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> tuple[list[tuple[Path, Path]], list[tuple[Path, str]]]:
+    """정리 결과 기록대로 파일을 원래 위치에 되돌린다. 이동할 때와 같이 복사·검증한 뒤에만 지운다."""
+    destination = report.resolve().parent
+    jobs = undo_jobs(report)
+    restored: list[tuple[Path, Path]] = []
+    errors: list[tuple[Path, str]] = []
+    for index, (status, result, original) in enumerate(jobs, 1):
+        if should_cancel and should_cancel():
+            break
+        try:
+            # 기록이 고쳐졌어도 결과 폴더 밖의 파일을 옮기거나 결과 폴더 안으로 되돌리지 않는다.
+            if (not result.is_absolute() or not original.is_absolute()
+                    or not result.resolve().is_relative_to(destination)
+                    or original.resolve().is_relative_to(destination)):
+                raise ValueError("기록의 경로가 결과 폴더와 맞지 않습니다")
+            if not result.is_file() or result.is_symlink():
+                raise ValueError("결과 폴더에 파일이 없습니다")
+            if original.exists() or original.is_symlink():
+                raise ValueError("원래 위치에 같은 이름의 파일이 이미 있어 건너뛰었습니다")
+            original.parent.mkdir(parents=True, exist_ok=True)
+            digest = _digest(result)
+            temporary = _stage(result, original.parent, digest)
+            try:
+                temporary.rename(original)
+            finally:
+                temporary.unlink(missing_ok=True)
+            if _digest(original) != digest:
+                original.unlink(missing_ok=True)
+                raise ValueError("되돌린 파일 검증 실패: 결과 폴더의 파일을 유지했습니다")
+            if status == "이동":
+                try:
+                    result.unlink()
+                except OSError as exc:
+                    raise OSError(f"원래 위치에 되돌렸지만 결과 폴더의 파일을 지우지 못해 두 곳에 있습니다: {exc}") from exc
+            restored.append((result, original))
+        except (OSError, ValueError) as exc:
+            errors.append((original, str(exc)))
+        finally:
+            if progress:
+                progress(index, len(jobs))
+    # 비워진 결과 하위 폴더만 지운다. 파일이 남은 폴더와 결과 폴더 자체는 그대로 둔다.
+    for current, _, _ in sorted(os.walk(destination), key=lambda item: -len(item[0])):
+        if Path(current) != destination:
+            try:
+                os.rmdir(current)
+            except OSError:
+                pass
+    return restored, errors

@@ -7,6 +7,7 @@ from collections import Counter
 import http.client
 import json
 import math
+import os
 import re
 from pathlib import Path
 from collections.abc import Callable
@@ -24,6 +25,8 @@ SIMILARITY = 0.54
 SMALL_FOLDER = 2
 # 819개 평가: 0.8 이상 병합 7건 중 6건이 같은 주제였다(예외: 제조업→음식업). 더 낮추면 업종끼리 섞인다.
 MERGE_SIMILARITY = 0.8
+# 세 폴더 평가: 0.75 이상은 거의 같은 주제였고, 그 아래부터 '기능'·'기반' 같은 흔한 단어로 잘못 합쳐졌다.
+CONSOLIDATE_SIMILARITY = 0.75
 
 AI_ONLY_INSTRUCTIONS = (
     "PC 파일 묶음마다 짧은 folder와 reason을 JSON으로 반환한다. "
@@ -444,6 +447,61 @@ def _small_folder_matches(
     return matches
 
 
+def _folder_members(
+    proposals: list[tuple[Document, str, str]], protected: set[str],
+) -> dict[str, list[Document]]:
+    members: dict[str, list[Document]] = {}
+    for doc, folder, _ in proposals:
+        if folder != "미분류" and folder.replace(" ", "").casefold() not in protected:
+            members.setdefault(folder, []).append(doc)
+    return members
+
+
+def _consolidation_pairs(
+    proposals: list[tuple[Document, str, str]],
+    vector_of: dict[Path, list[float]],
+    protected: set[str],
+) -> list[tuple[float, str, str]]:
+    """이름에 같은 단어가 있는 폴더 쌍마다 (두 폴더 내용의 유사도, 폴더, 폴더)를 돌려준다.
+
+    작은 로컬 모델에 폴더 이름 목록을 통째로 주면 엉뚱한 쌍을 많이 제안해서, 이름 단어와
+    임베딩 유사도를 함께 보는 규칙을 쓴다.
+    """
+    members = _folder_members(proposals, protected)
+    names = sorted(members)
+    words = {name: _tokens(name) for name in names}
+    centers = {
+        name: _unit([sum(values) for values in zip(*(vector_of[doc.source] for doc in members[name]))])
+        for name in names
+    }
+    return [
+        (_dot(centers[left], centers[right]), left, right)
+        for position, left in enumerate(names) for right in names[position + 1:]
+        if words[left] & words[right]
+    ]
+
+
+def _consolidated_names(
+    proposals: list[tuple[Document, str, str]], pairs: list[tuple[str, str]],
+) -> dict[str, str]:
+    """합칠 쌍을 묶음으로 모아, 파일이 가장 많은 폴더 이름으로 바꿀 표를 만든다."""
+    sizes = Counter(folder for _, folder, _ in proposals)
+    parent: dict[str, str] = {}
+
+    def find(name: str) -> str:
+        while parent.get(name, name) != name:
+            name = parent[name]
+        return name
+
+    for left, right in pairs:
+        left, right = find(left), find(right)
+        if left != right:
+            # 큰 폴더 쪽을 대표로 삼아 순환 없이 합친다.
+            keep, drop = sorted((left, right), key=lambda name: (-sizes[name], name))
+            parent[drop] = keep
+    return {name: find(name) for name in parent}
+
+
 def _input_text(doc: Document, limit: int) -> str:
     return (
         f"파일명: {doc.source.stem}\n"
@@ -452,6 +510,9 @@ def _input_text(doc: Document, limit: int) -> str:
         f"본문: {doc.lead_text[:limit] if not doc.error else ''}"
     )
 
+
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".bmp", ".tif", ".tiff"}
+IMAGE_FOLDER = "사진·이미지"
 
 # 글꼴은 파일명에 제품명이 있어도 문서 주제로 분류하지 않는다.
 AI_EXCLUDED_TYPES = {".otf", ".ttf"}
@@ -699,6 +760,18 @@ def assign_ai_folders(
                 for doc, folder, reason in proposals
             ]
             labelled_groups = [(group, merged.get(name, name)) for group, name in labelled_groups]
+        # 같은 주제가 여러 이름으로 흩어진 폴더(예: '대기시간 조회 시스템'과 '대기시간 예측')를
+        # 이름의 공통 단어와 내용 유사도가 모두 맞을 때 합친다.
+        pairs = _consolidation_pairs(proposals, vector_of, type_names)
+        renamed = _consolidated_names(
+            proposals, [(left, right) for score, left, right in pairs if score >= CONSOLIDATE_SIMILARITY])
+        if renamed:
+            proposals = [
+                (doc, renamed[folder], f"{reason} · 폴더 통합: {folder}")
+                if folder in renamed else (doc, folder, reason)
+                for doc, folder, reason in proposals
+            ]
+            labelled_groups = [(group, renamed.get(name, name)) for group, name in labelled_groups]
     subfolders = _subfolder_suggestions(eligible, labelled_groups, subdivide, should_cancel)
     if progress and total:
         progress(total * 3, total * 3)
@@ -724,6 +797,33 @@ def assign_ai_folders(
         doc.subfolder, sub_reason = subfolders.get(doc.source, ("", ""))
         doc.folder_reason = f"AI 분류: {reason}" + (f" · 하위: {sub_reason}" if sub_reason else "")
     if ai_only:
+        # 지금은 이미지를 OCR 글자로만 판단하므로 사진·로고·화면 시안은 단서가 거의 없다.
+        # 주제를 찾지 못한 이미지는 미분류로 흩지 않고, 원래 같은 폴더에 있던 것끼리
+        # '사진·이미지/<원래 폴더>'에 모아 원래 묶음을 지킨다.
+        # 글자가 많이 읽힌 이미지는 스캔 문서일 수 있어 사진 폴더에 묻지 않고 미분류로 둔다.
+        unplaced = [doc for doc in originals
+                    if doc.folder == "미분류" and doc.source.suffix.lower() in IMAGE_SUFFIXES
+                    and len(doc.lead_text.strip()) < 80]
+        if unplaced:
+            try:
+                root = Path(os.path.commonpath([str(doc.source.parent) for doc in originals]))
+            except ValueError:  # 드라이브가 다르면 공통 상위 폴더가 없다.
+                root = None
+            per_parent = Counter(doc.source.parent for doc in unplaced)
+            for doc in unplaced:
+                parent = doc.source.parent
+                keep = (parent != root and per_parent[parent] >= 2
+                        and valid_folder_name(parent.name) and len(parent.name) <= 40)
+                doc.folder, doc.subfolder = IMAGE_FOLDER, parent.name if keep else ""
+                doc.folder_reason = ("이미지: 주제 단서 없음 · 원래 폴더 유지" if keep
+                                     else "이미지: 주제 단서 없음")
+        # 동영상·녹음·바로가기처럼 설정에서 형식별로 두기로 한 파일은
+        # AI가 주제를 찾지 못하면 미분류 대신 형식 폴더에 둔다.
+        for doc in originals:
+            if (doc.folder == "미분류" and is_type_only(doc.source)
+                    and not is_structured_file(doc.source)):
+                doc.folder, doc.subfolder = type_folder(doc.source), ""
+                doc.folder_reason = f"파일 형식: {doc.source.suffix.lower() or '없음'}"
         structured: dict[tuple[Path, str], list[Document]] = {}
         for doc in originals:
             if is_structured_file(doc.source):
