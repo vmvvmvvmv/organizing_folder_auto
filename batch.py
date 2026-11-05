@@ -6,7 +6,7 @@ import json
 from collections import Counter
 from pathlib import Path
 
-from organizer import Document, default_destination, move_documents, scan, write_result_report
+from organizer import Document, default_destination, move_documents, scan, ResultReport
 from reader import SUPPORTED, find_tesseract
 
 
@@ -39,6 +39,7 @@ def main() -> None:
             "documents": [{
                 "source": str(doc.source),
                 "folder": doc.folder,
+                "subfolder": doc.subfolder,
                 "folder_reason": doc.folder_reason,
                 "method": doc.method,
                 "error": doc.error,
@@ -74,16 +75,19 @@ def main() -> None:
             path, item["folder"], item["folder_reason"], item["method"],
             item["error"], Path(item["duplicate_of"]) if item["duplicate_of"] else None,
             preview_digest=bytes.fromhex(item["sha256"]),
+            subfolder=item.get("subfolder", ""),
         ))
     destination.mkdir(exist_ok=True)
-    moved, deduplicated, errors = move_documents(documents, destination, source_root=source)
-    report = write_result_report(source, destination, documents, moved, deduplicated, errors)
+    with ResultReport(source, destination, documents) as report:
+        moved, deduplicated, errors = move_documents(
+            documents, destination, source_root=source, record=report.record,
+        )
     print(json.dumps({
         "moved": len(moved),
         "duplicates_removed": len(deduplicated),
         "errors": [(str(doc.source), message) for doc, message in errors],
         "destination": str(destination),
-        "report": str(report),
+        "report": str(report.path),
     }, ensure_ascii=True))
 
 

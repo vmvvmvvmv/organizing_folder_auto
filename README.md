@@ -13,11 +13,18 @@ Windows 폴더의 문서를 읽고 비슷한 파일을 폴더별로 정리합니
 ![문서 OCR 정리 화면](assets/app-screen.png)
 
 1. 원본 폴더와 결과 폴더를 선택합니다.
-2. 분류 미리보기를 눌러 폴더와 파일을 확인합니다. 필요한 경우 폴더 이름을 바꿉니다.
+2. 분류 미리보기에서 파일을 폴더로 끌어 놓거나, 이름을 더블클릭·우클릭해 수정합니다.
 3. 정리 시작을 누르면 파일이 결과 폴더로 이동합니다. 처리 결과는 CSV 파일로 저장됩니다.
 
 ## 로컬 AI 분류 (선택)
 
-[Ollama](https://ollama.com/download/windows)를 설치하고 PowerShell에서 `ollama pull qwen3-embedding:0.6b`를 실행하세요. 앱에서 **로컬 AI 분류**를 켜고 분류 미리보기를 누르면, 읽을 수 있는 미분류 파일을 비슷한 기존 폴더에 제안합니다.
+[Ollama](https://ollama.com/download/windows)를 설치하고 아래 모델을 받으세요.
+
+```powershell
+ollama pull qwen3-embedding:0.6b
+ollama pull qwen3:4b-instruct
+```
+
+**로컬 AI만 분류**를 켜면 공통 단어 규칙 없이 로컬 AI가 폴더를 제안합니다. AI가 판단하지 못한 파일은 미분류로 남습니다. 모델은 앱에 포함되지 않습니다.
 
 라이선스: [AGPL-3.0](LICENSE)

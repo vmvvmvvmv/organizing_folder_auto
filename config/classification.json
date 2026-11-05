@@ -7,11 +7,19 @@
     "xlsx", "pptx", "ppt", "skm", "kakaotalk"
   ],
   "file_groups": [
-    {"folder": "GIS 자료", "extensions": [".shp", ".shx", ".dbf", ".prj", ".cpg", ".geojson", ".gpkg", ".qgz"], "preserve_structure": true},
+    {"folder": "GIS 자료", "extensions": [".shp", ".shx", ".dbf", ".prj", ".cpg", ".geojson", ".gpkg", ".qgz", ".msld"], "preserve_structure": true},
     {"folder": "프로그램 자료", "extensions": [".dll", ".exe", ".cab", ".msi", ".ini", ".inf", ".bat", ".jar", ".py", ".java", ".gradle", ".properties"], "preserve_structure": true},
+    {"folder": "설정·보조 파일", "extensions": [".cst", ".fix"], "preserve_structure": false},
+    {"folder": "분석 노트북", "extensions": [".ipynb"], "preserve_structure": false, "always_by_type": true},
+    {"folder": "마크다운 문서", "extensions": [".qmd"], "preserve_structure": false},
     {"folder": "글꼴", "extensions": [".otf", ".ttf"], "preserve_structure": false},
     {"folder": "표 데이터", "extensions": [".csv", ".tsv"], "preserve_structure": false},
     {"folder": "압축 파일", "extensions": [".zip", ".7z", ".rar"], "preserve_structure": false},
+    {"folder": "바로가기", "extensions": [".lnk", ".url"], "preserve_structure": false, "always_by_type": true},
+    {"folder": "녹음 파일", "extensions": [".m4a", ".wav", ".aac", ".amr"], "preserve_structure": false, "always_by_type": true},
+    {"folder": "음악 파일", "extensions": [".mp3", ".flac", ".ogg", ".wma"], "preserve_structure": false, "always_by_type": true},
+    {"folder": "동영상", "extensions": [".mp4", ".mov", ".avi", ".mkv", ".wmv"], "preserve_structure": false, "always_by_type": true},
+    {"folder": "사진·이미지", "extensions": [".gif", ".webp", ".heic"], "preserve_structure": false, "always_by_type": true},
     {"folder": "기타 문서", "extensions": [".hwp", ".doc", ".xls", ".ppt", ".txt", ".md", ".xml"], "preserve_structure": false}
   ]
 }
