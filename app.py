@@ -6,11 +6,17 @@ import queue
 import os
 from collections.abc import Callable
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from ai_groups import assign_ai_folders
+import contextlib
+import webbrowser
+
+from quality_score import quality_check
+from local_cache import LocalCache, cached_ollama, clear_cache, default_cache_path
+from ai_groups import OLLAMA_DOWNLOAD, assign_ai_folders, ollama_missing_models, ollama_pull
 from organizer import Document, default_destination, move_documents, reassign_documents, rename_document, rename_folder, rename_subfolder, scan, source_files, undo_jobs, undo_report, valid_folder_name, ResultReport
 from reader import IMAGE_TYPES, MAX_FILE_BYTES, SUPPORTED, find_tesseract, ocr_status
 
@@ -32,11 +38,37 @@ def ai_preview_note(
     documents: list[Document], enabled: bool,
     progress: Callable[[int, int], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    calls: dict[str, Callable] | None = None,
+    source_root: Path | None = None,
 ) -> str:
+    """calls에 저장소를 쓰는 Ollama 함수 묶음(local_cache.cached_ollama)을 주면 같은 질문을 다시 하지 않는다."""
     if not enabled:
         return ""
-    count = assign_ai_folders(documents, progress=progress, should_cancel=should_cancel, ai_only=True)
+    count = assign_ai_folders(documents, progress=progress, should_cancel=should_cancel, ai_only=True,
+                              source_root=source_root, **(calls or {}))
     return f"AI 분류 {count}개."
+
+
+def _duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{max(1, round(seconds))}초"
+    if seconds < 3600:
+        return f"{round(seconds / 60)}분"
+    return f"{int(seconds // 3600)}시간 {round(seconds % 3600 / 60)}분"
+
+
+def progress_text(label: str, started: float, done: int, total: int) -> str:
+    """진행 수와 지금까지 속도로 계산한 남은 시간을 보여준다."""
+    text = f"{label}: {done}/{total}"
+    elapsed = time.monotonic() - started
+    if 0 < done < total and elapsed >= 3:
+        text += f" · 남은 시간 약 {_duration(elapsed / done * (total - done))}"
+    return text
+
+
+def progress_reporter(events: queue.Queue, label: str) -> Callable[[int, int], None]:
+    started = time.monotonic()
+    return lambda done, total: events.put(("progress", progress_text(label, started, done, total)))
 
 def group_preview_documents(documents: list[Document], mode: str) -> dict[str, dict[str, list[int]]]:
     """현재 필터의 파일을 주제와 하위 폴더별로 묶는다."""
@@ -141,6 +173,7 @@ class OrganizerApp(tk.Tk):
         self.rename_item: str | None = None
         self.context_item: str | None = None
         self.ai_var = tk.BooleanVar(value=False)
+        self.cache_var = tk.BooleanVar(value=True)
 
         frame = ttk.Frame(self, padding=14)
         frame.pack(fill="both", expand=True)
@@ -155,8 +188,15 @@ class OrganizerApp(tk.Tk):
         ttk.Entry(frame, textvariable=self.destination_var).grid(row=1, column=1, sticky="ew", padx=8)
         ttk.Button(frame, text="선택", command=self.choose_destination).grid(row=1, column=2)
 
-        self.ai_checkbox = ttk.Checkbutton(frame, text="로컬 AI 분류 (규칙 검증 포함)", variable=self.ai_var)
+        self.ai_checkbox = ttk.Checkbutton(frame, text="로컬 AI 분류 (규칙 검증 포함)", variable=self.ai_var,
+                                           command=self.on_ai_toggle)
         self.ai_checkbox.grid(row=2, column=2, sticky="e")
+        cache_options = ttk.Frame(frame)
+        cache_options.grid(row=2, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(cache_options, text="읽은 내용을 이 PC에 저장 (다시 볼 때 빠르게)",
+                        variable=self.cache_var).pack(side="left")
+        ttk.Button(cache_options, text="저장 내용 지우기", command=self.clear_saved_cache).pack(
+            side="left", padx=8)
         self.scan_button = ttk.Button(frame, text="분류 미리보기", command=self.start_scan)
         self.scan_button.grid(row=3, column=0, sticky="w", pady=8)
         self.cancel_button = ttk.Button(frame, text="중단", command=self.cancel_current, state="disabled")
@@ -386,6 +426,85 @@ class OrganizerApp(tk.Tk):
         self.close_requested = True
         self.cancel_current()
 
+    def on_ai_toggle(self) -> None:
+        """AI 분류를 켜면 Ollama와 모델이 준비됐는지 먼저 확인한다."""
+        if not self.ai_var.get() or self.busy:
+            return
+        self.status_var.set("로컬 AI 준비 상태를 확인하는 중입니다…")
+
+        def work() -> None:
+            try:
+                self.events.put(("ai_setup", ollama_missing_models(), ""))
+            except RuntimeError as exc:
+                self.events.put(("ai_setup", [], str(exc)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _handle_ai_setup(self, missing: list[str], error: str) -> None:
+        if error:
+            self.ai_var.set(False)
+            self.status_var.set(f"{error}. Ollama를 설치·실행한 뒤 '로컬 AI 분류'를 다시 켜세요.")
+            if messagebox.askyesno(
+                "로컬 AI 준비",
+                f"{error}.\n\n로컬 AI 분류에는 무료 프로그램 Ollama가 필요합니다. "
+                "설치하고 실행한 뒤 다시 켜세요.\n\n다운로드 페이지를 열까요?",
+            ):
+                webbrowser.open(OLLAMA_DOWNLOAD)
+            return
+        if not missing:
+            self.status_var.set("로컬 AI 사용 가능")
+            return
+        if messagebox.askyesno(
+            "로컬 AI 모델 받기",
+            f"필요한 AI 모델이 아직 없습니다: {', '.join(missing)}\n\n"
+            "처음 한 번만 받으면 됩니다(모두 약 3GB, 인터넷 필요). 지금 받을까요?",
+        ):
+            self.start_model_pull(missing)
+        else:
+            self.ai_var.set(False)
+            self.status_var.set("AI 모델이 없어 로컬 AI 분류를 껐습니다")
+
+    def start_model_pull(self, models: list[str]) -> None:
+        self.cancel_event.clear()
+        self._set_busy(True)
+
+        def work() -> None:
+            try:
+                for position, model in enumerate(models, 1):
+                    ollama_pull(
+                        model,
+                        lambda done, total, position=position, model=model: self.events.put((
+                            "progress",
+                            f"AI 모델 받는 중 ({position}/{len(models)}) {model}: "
+                            f"{done / 1e9:.1f} / {total / 1e9:.1f} GB",
+                        )),
+                        should_cancel=self.cancel_event.is_set,
+                    )
+                self.events.put(("pulled", ""))
+            except InterruptedError:
+                self.events.put(("pulled", "모델 받기를 중단했습니다"))
+            except RuntimeError as exc:
+                self.events.put(("pulled", str(exc)))
+
+        threading.Thread(target=work, daemon=False).start()
+
+    def clear_saved_cache(self) -> None:
+        if self.busy:
+            return
+        path = default_cache_path()
+        if not messagebox.askyesno(
+            "저장 내용 지우기",
+            f"이 PC에 저장한 파일 해시·읽은 본문·AI 응답을 지울까요?\n{path}\n"
+            "원본 파일은 그대로이고, 다음 미리보기만 처음처럼 오래 걸립니다.",
+        ):
+            return
+        try:
+            clear_cache(path)
+        except OSError as exc:
+            messagebox.showerror("저장 내용 지우기", str(exc))
+            return
+        self.status_var.set("저장한 내용을 지웠습니다")
+
     def start_scan(self) -> None:
         if self.busy:
             return
@@ -394,6 +513,7 @@ class OrganizerApp(tk.Tk):
             return
         source, destination = paths
         use_ai = self.ai_var.get()
+        use_cache = self.cache_var.get()
         self.documents = []
         self.preview_paths = None
         self.refresh_table()
@@ -403,23 +523,33 @@ class OrganizerApp(tk.Tk):
 
         def work() -> None:
             try:
-                documents = scan(
-                    source, destination, find_tesseract(),
-                    lambda done, total: self.events.put(("progress", f"문서 읽는 중: {done}/{total}")),
-                    should_cancel=self.cancel_event.is_set,
-                    classify=not use_ai,
-                )
-                if self.cancel_event.is_set():
-                    raise InterruptedError("검사가 중단되었습니다")
                 if use_ai:
-                    self.events.put(("progress", "로컬 AI로 문서 임베딩과 폴더명을 계산하는 중입니다…"))
-                ai_note = ai_preview_note(
-                    documents, use_ai,
-                    progress=lambda done, total: self.events.put((
-                        "progress", f"로컬 AI 분류 중: {done}/{total}"
-                    )),
-                    should_cancel=self.cancel_event.is_set,
-                )
+                    # 긴 읽기를 마친 뒤에야 모델이 없다고 알리지 않도록 먼저 확인한다.
+                    missing = ollama_missing_models()
+                    if missing:
+                        raise RuntimeError(
+                            f"AI 모델이 없습니다: {', '.join(missing)}. "
+                            "'로컬 AI 분류'를 껐다 다시 켜면 받을 수 있습니다")
+                # 저장소는 이 작업 스레드에서만 열고 닫는다.
+                with contextlib.ExitStack() as stack:
+                    cache = stack.enter_context(LocalCache(default_cache_path())) if use_cache else None
+                    documents = scan(
+                        source, destination, find_tesseract(),
+                        progress_reporter(self.events, "문서 읽는 중"),
+                        should_cancel=self.cancel_event.is_set,
+                        classify=not use_ai, cache=cache,
+                    )
+                    if self.cancel_event.is_set():
+                        raise InterruptedError("검사가 중단되었습니다")
+                    if use_ai:
+                        self.events.put(("progress", "로컬 AI로 문서 임베딩과 폴더명을 계산하는 중입니다…"))
+                    ai_note = ai_preview_note(
+                        documents, use_ai,
+                        progress=progress_reporter(self.events, "로컬 AI 분류 중"),
+                        should_cancel=self.cancel_event.is_set,
+                        calls=cached_ollama(cache.responses()) if cache else None,
+                        source_root=source,
+                    )
                 if self.cancel_event.is_set():
                     raise InterruptedError("검사가 중단되었습니다")
                 projects = source_files(source, destination)[1]
@@ -917,7 +1047,7 @@ class OrganizerApp(tk.Tk):
             try:
                 restored, errors = undo_report(
                     report,
-                    lambda done, total: self.events.put(("progress", f"되돌리는 중: {done}/{total}")),
+                    progress_reporter(self.events, "되돌리는 중"),
                     should_cancel=self.cancel_event.is_set,
                 )
                 self.events.put(("undone", restored, errors, len(jobs)))
@@ -955,7 +1085,7 @@ class OrganizerApp(tk.Tk):
                 with ResultReport(source, destination, self.documents) as report:
                     moved, deduplicated, errors = move_documents(
                         self.documents, destination,
-                        lambda done, total: self.events.put(("progress", f"이동 중: {done}/{total}")),
+                        progress_reporter(self.events, "이동 중"),
                         should_cancel=self.cancel_event.is_set,
                         source_root=source,
                         record=report.record,
@@ -988,6 +1118,7 @@ class OrganizerApp(tk.Tk):
                         f"미분류 {unknown}개 · 읽기 실패 {failed}개 · "
                         f"동일 파일 {duplicates}개 · 파일명 기준 {filename_only}개."
                         + (f" {event[3]}" if event[3] else "")
+                        + f"\n{quality_check(self.documents).summary()}"
                     )
                     self._set_busy(False)
                 elif kind == "cancelled_scan":
@@ -1014,6 +1145,17 @@ class OrganizerApp(tk.Tk):
                         messagebox.showinfo(
                             "정리 결과", f"{len(moved)}개 이동, 중복 원본 {len(deduplicated)}개 정리.\n{destination}"
                         )
+                elif kind == "ai_setup":
+                    self._handle_ai_setup(event[1], event[2])
+                elif kind == "pulled":
+                    self._set_busy(False)
+                    if event[1]:
+                        self.ai_var.set(False)
+                        self.status_var.set(event[1])
+                        if not self.close_requested:
+                            messagebox.showerror("AI 모델 받기", event[1])
+                    else:
+                        self.status_var.set("AI 모델을 받았습니다. 로컬 AI 사용 가능")
                 elif kind == "undone":
                     restored, errors, total = event[1:]
                     # 파일 위치가 바뀌었으므로 예전 미리보기로는 정리할 수 없다.

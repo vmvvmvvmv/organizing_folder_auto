@@ -20,6 +20,8 @@ from math import comb
 from pathlib import Path
 
 import ai_groups
+import local_cache
+from quality_score import quality_check
 from ai_groups import assign_ai_folders
 from organizer import Document, scan
 from reader import find_tesseract
@@ -58,41 +60,14 @@ def score_labels(expected: list[str], predicted: list[str]) -> dict:
 
 
 def cached_ollama(cache_file: Path) -> tuple[dict[str, Callable], Callable[[], None]]:
-    """앱과 같은 Ollama 호출을 하되 같은 요청은 저장된 응답(오류 포함)을 다시 쓴다.
-
-    assign_ai_folders(**calls)에 그대로 넘길 함수 묶음과 캐시 저장 함수를 돌려준다.
-    """
-    cache = json.loads(cache_file.read_text(encoding="utf-8")) if cache_file.exists() else {}
-
-    def cached(kind: str, payload: object, call: Callable[[], list]) -> list:
-        key = kind + json.dumps(payload, ensure_ascii=False, sort_keys=True)
-        if key not in cache:
-            try:
-                cache[key] = {"ok": call()}
-            except (ai_groups.ContextSizeError, ai_groups.IncompleteResultError) as exc:
-                cache[key] = {"error": type(exc).__name__}
-        hit = cache[key]
-        if "error" in hit:
-            raise getattr(ai_groups, hit["error"])("저장된 Ollama 오류")
-        return hit["ok"] if kind == "embed" else [tuple(answer) for answer in hit["ok"]]
-
-    def embed(texts: list[str]) -> list[list[float]]:
-        return cached("embed", texts, lambda: ai_groups.ollama_embeddings(texts))
-
-    def classify(items: list[dict], known: list[str]) -> list[tuple[str, str]]:
-        # 앱의 AI 분류와 같은 지시문을 쓴다.
-        return cached("classify", [items, known], lambda: ai_groups.ollama_classify(
-            items, known, instructions_override=ai_groups.AI_ONLY_INSTRUCTIONS))
-
-    def subdivide(items: list[dict], parent: str) -> list[tuple[str, str]]:
-        return cached("sub", [items, parent], lambda: ai_groups.ollama_subdivide(items, parent))
+    """JSON 파일에 Ollama 응답을 저장하는 local_cache.cached_ollama. 함수 묶음과 저장 함수를 돌려준다."""
+    store = json.loads(cache_file.read_text(encoding="utf-8")) if cache_file.exists() else {}
 
     def save() -> None:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
-        cache_file.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+        cache_file.write_text(json.dumps(store, ensure_ascii=False), encoding="utf-8")
 
-    calls = {"embed": embed, "classify": classify, "subdivide": subdivide}
-    return calls, save
+    return local_cache.cached_ollama(store), save
 
 
 def load_documents(source: Path, documents_file: Path) -> list[Document]:
@@ -145,7 +120,7 @@ def evaluate(
     if cache_file:
         calls, save = cached_ollama(cache_file)
     try:
-        assign_ai_folders(documents, ai_only=True, **calls)
+        assign_ai_folders(documents, ai_only=True, source_root=source, **calls)
     finally:
         if save:
             save()
@@ -165,6 +140,7 @@ def evaluate(
         "merged_small_folders": sum("작은 폴더 병합" in doc.folder_reason for doc in documents),
         "consolidated": sum("폴더 통합" in doc.folder_reason for doc in documents),
         "read_failures": sum(bool(doc.error) for doc in documents),
+        "self_check": quality_check(documents).summary(),
     }
     for name, expected in labels.items():
         paths = list(expected)

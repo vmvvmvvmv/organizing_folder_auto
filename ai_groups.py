@@ -98,6 +98,62 @@ def _ollama_request(endpoint: str, model: str, body: dict, timeout: int) -> dict
         connection.close()
 
 
+OLLAMA_DOWNLOAD = "https://ollama.com/download/windows"
+REQUIRED_MODELS = (EMBED_MODEL, MODEL)
+
+
+def ollama_missing_models(timeout: float = 3) -> list[str]:
+    """Ollama가 꺼져 있거나 설치되지 않았으면 RuntimeError, 아니면 아직 받지 않은 필수 모델을 돌려준다."""
+    connection = http.client.HTTPConnection("127.0.0.1", 11434, timeout=timeout)
+    try:
+        connection.request("GET", "/api/tags")
+        data = json.loads(connection.getresponse().read())
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        raise RuntimeError("Ollama가 설치되어 있지 않거나 실행 중이 아닙니다") from exc
+    finally:
+        connection.close()
+    installed = {
+        name for model in data.get("models", []) if isinstance(model, dict)
+        for name in (model.get("name"), model.get("model")) if isinstance(name, str)
+    }
+    return [model for model in REQUIRED_MODELS
+            if model not in installed and f"{model}:latest" not in installed]
+
+
+def ollama_pull(
+    model: str,
+    progress: Callable[[int, int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> None:
+    """Ollama로 모델을 받는다. 받은 바이트와 전체 바이트를 progress로 알린다."""
+    connection = http.client.HTTPConnection("127.0.0.1", 11434, timeout=60)
+    try:
+        connection.request(
+            "POST", "/api/pull", json.dumps({"model": model, "stream": True}).encode("utf-8"),
+            {"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        if response.status != 200:
+            raise RuntimeError(f"모델을 받지 못했습니다: HTTP {response.status}")
+        for line in response:
+            if should_cancel and should_cancel():
+                raise InterruptedError("모델 받기를 중단했습니다")
+            if not line.strip():
+                continue
+            status = json.loads(line)
+            if status.get("error"):
+                raise RuntimeError(f"모델을 받지 못했습니다: {status['error']}")
+            if progress and status.get("total"):
+                progress(int(status.get("completed") or 0), int(status["total"]))
+            if status.get("status") == "success":
+                return
+        raise RuntimeError("모델 받기가 끝나기 전에 연결이 끊겼습니다")
+    except (OSError, http.client.HTTPException, ValueError) as exc:
+        raise RuntimeError(f"모델을 받지 못했습니다: {exc}") from exc
+    finally:
+        connection.close()
+
+
 def _unit(vector: list[float]) -> list[float]:
     if not isinstance(vector, list) or not vector or any(
         not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value)
@@ -198,12 +254,49 @@ def _representatives(group: list[int]) -> list[int]:
     return [group[position] for position in dict.fromkeys(positions)]
 
 
-def _document_hint(doc: Document, text_limit: int) -> dict[str, str]:
+# 문서 안에 AI에게 하는 지시처럼 보이는 문장. 프롬프트로 "따르지 말라"고 해도 작은 모델은 따르는 일이
+# 있어(극한 테스트에서 '해킹성공' 폴더가 만들어졌다), AI에 보내기 전과 근거 검사 전에 빼 버린다.
+INSTRUCTION_LIKE = re.compile(
+    r"(이전|위의|앞의|기존|모든)\s*(지시|명령|규칙|프롬프트)\S*\s*(을|를)?\s*(무시|잊)"
+    r"|(지시|명령)\S*\s*(을|를)?\s*무시"
+    r"|폴더\S*\s*(에|으로|로)\s*(넣|옮기|분류)\S*\s*(라|세요|해라|하라)"
+    r"|폴더\s*(명|이름)\S*\s*(은|는)?\s*(반드시|꼭)"
+    r"|(모든|전체)\s*파일\S*\s*(을|를)?\s*(삭제|지워)"
+    r"|ignore\s+(all\s+|any\s+)?(the\s+)?(previous|prior|above)\s+(instructions|prompts?)"
+    r"|(you\s+are|act\s+as)\s+(an?\s+|the\s+)?(ai|assistant|language model)",
+    re.IGNORECASE,
+)
+
+
+def _clean_text(text: str) -> str:
+    """AI에게 하는 지시처럼 보이는 문장을 뺀 본문."""
+    if not INSTRUCTION_LIKE.search(text):
+        return text
+    sentences = re.split(r"(?<=[.!?。\n])\s*", text)
+    return " ".join(sentence for sentence in sentences if not INSTRUCTION_LIKE.search(sentence)).strip()
+
+
+def _context(doc: Document, root: Path | None) -> list[str]:
+    """선택한 폴더 아래의 상위 폴더 이름(최대 2단계). 선택한 폴더 자체와 그 위 이름은 넣지 않는다.
+
+    선택한 폴더 이름('홍길동 자료', '정리해야될 것' 등)은 모든 파일에 공통이라 주제 단서가 아니다.
+    """
+    parent = doc.source.parent
+    if root is not None:
+        try:
+            return list(parent.relative_to(root).parts[-2:])
+        except ValueError:
+            pass
+    return list(parent.parts[-2:])
+
+
+def _document_hint(doc: Document, text_limit: int, root: Path | None = None) -> dict[str, str]:
+    context = _context(doc, root)
     return {
         "name": doc.source.name,
-        "parent": doc.source.parent.name,
-        "source_context": " / ".join(doc.source.parent.parts[-2:]),
-        "text": doc.lead_text[:text_limit],
+        "parent": context[-1] if context else "",
+        "source_context": " / ".join(context),
+        "text": _clean_text(doc.lead_text)[:text_limit],
         "extension": doc.source.suffix.lower(),
     }
 
@@ -231,12 +324,12 @@ def _canonical_ai_type(folder: str, group: list[int], documents: list[Document])
 
 def _label_has_evidence(
     folder: str, group: list[int], documents: list[Document], ai_only: bool = False,
-    text_limit: int = 120,
+    text_limit: int = 120, root: Path | None = None,
 ) -> bool:
     terms = _tokens(folder)
     text = re.sub(
         r"[^가-힣A-Za-z]", "",
-        " ".join(f"{documents[index].source.stem} {documents[index].lead_text[:text_limit]}"
+        " ".join(f"{documents[index].source.stem} {_clean_text(documents[index].lead_text)[:text_limit]}"
                  for index in group),
     ).casefold()
     if any(term in text for term in terms):
@@ -252,7 +345,7 @@ def _label_has_evidence(
             return False
         parents = re.sub(
             r"[^가-힣A-Za-z]", "",
-            " ".join(" ".join(documents[index].source.parent.parts[-2:]) for index in group),
+            " ".join(" ".join(_context(documents[index], root)) for index in group),
         ).casefold()
         return any(term in parents for term in terms)
     return False
@@ -283,6 +376,7 @@ def _subfolder_suggestions(
     labelled_groups: list[tuple[list[int], str]],
     subdivide: Callable[[list[dict], str], list[tuple[str, str]]],
     should_cancel: Callable[[], bool] | None,
+    root: Path | None = None,
 ) -> dict[Path, tuple[str, str]]:
     """연도가 명확하면 파일명으로, 아니면 구별되는 문서군만 세부 주제로 나눈다."""
     by_parent: dict[str, list[list[int]]] = {}
@@ -350,7 +444,8 @@ def _subfolder_suggestions(
         items = [
             {
                 "id": position,
-                "documents": [_document_hint(documents[index], 120) for index in _representatives(cluster)],
+                "documents": [_document_hint(documents[index], 120, root)
+                              for index in _representatives(cluster)],
                 "count": len(cluster),
             }
             for position, cluster in enumerate(candidates)
@@ -502,12 +597,12 @@ def _consolidated_names(
     return {name: find(name) for name in parent}
 
 
-def _input_text(doc: Document, limit: int) -> str:
+def _input_text(doc: Document, limit: int, root: Path | None = None) -> str:
     return (
         f"파일명: {doc.source.stem}\n"
         f"확장자: {doc.source.suffix.lower() or '없음'}\n"
-        f"상위 폴더: {' / '.join(doc.source.parent.parts[-2:])}\n"
-        f"본문: {doc.lead_text[:limit] if not doc.error else ''}"
+        f"상위 폴더: {' / '.join(_context(doc, root))}\n"
+        f"본문: {_clean_text(doc.lead_text)[:limit] if not doc.error else ''}"
     )
 
 
@@ -540,12 +635,15 @@ def assign_ai_folders(
     progress: Callable[[int, int], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
     ai_only: bool = False,
+    source_root: Path | None = None,
 ) -> int:
     """선택한 폴더 안에서만 묶음을 만들고, 모두 성공하면 미리보기에 한꺼번에 반영한다."""
     if batch_size < 1 or label_batch_size < 1:
         raise ValueError("AI 묶음 크기는 1 이상이어야 합니다")
     originals = [doc for doc in documents if doc.duplicate_of is None]
-    eligible = [doc for doc in originals if _eligible(doc, ai_only)]
+    # 사용자가 고른 폴더. 그 이름은 모든 파일에 공통이라 AI 단서·근거로 쓰지 않는다.
+    root = source_root.resolve() if source_root else None
+    eligible =[doc for doc in originals if _eligible(doc, ai_only)]
     eligible_sources = {doc.source for doc in eligible}
     total = len(eligible)
     if ai_only and classify is ollama_classify:
@@ -561,7 +659,7 @@ def assign_ai_folders(
             raise InterruptedError("AI 분류가 중단되었습니다")
         batch = eligible[start:start + limit]
         try:
-            result = embed([_input_text(doc, text_limit) for doc in batch])
+            result = embed([_input_text(doc, text_limit, root) for doc in batch])
         except (ContextSizeError, IncompleteResultError) as exc:
             if len(batch) > 1:
                 limit = max(1, len(batch) // 2)
@@ -598,7 +696,7 @@ def assign_ai_folders(
             {
                 "id": index,
                 "documents": [
-                    _document_hint(eligible[member], sample_limit)
+                    _document_hint(eligible[member], sample_limit, root)
                     for member in _representatives(group)
                 ],
                 "count": len(group),
@@ -638,7 +736,7 @@ def assign_ai_folders(
                 accepted: dict[str, list[int]] = {}
                 for member in group:
                     candidate = _canonical_ai_type(folder, [member], eligible)
-                    if candidate != "미분류" and not _label_has_evidence(candidate, [member], eligible, True):
+                    if candidate != "미분류" and not _label_has_evidence(candidate, [member], eligible, True, root=root):
                         candidate = "미분류"
                     if candidate != "미분류":
                         key = candidate.replace(" ", "").casefold()
@@ -654,7 +752,7 @@ def assign_ai_folders(
                 labelled_groups.extend((members, name) for name, members in accepted.items())
                 completed += len(group)
                 continue
-            if folder != "미분류" and not _label_has_evidence(folder, group, eligible, ai_only):
+            if folder != "미분류" and not _label_has_evidence(folder, group, eligible, ai_only, root=root):
                 if len(group) >= 3 and _strong_name_terms(group, eligible):
                     if should_cancel and should_cancel():
                         raise InterruptedError("AI 분류가 중단되었습니다")
@@ -667,17 +765,17 @@ def assign_ai_folders(
                                 candidate = " ".join(candidate.replace("_", " ").split())
                                 explanation = " ".join(explanation.split())[:120]
                                 if (valid_folder_name(candidate) and explanation
-                                        and _label_has_evidence(candidate, group, eligible, ai_only)):
+                                        and _label_has_evidence(candidate, group, eligible, ai_only, root=root)):
                                     folder, reason = candidate, explanation
                     except (RuntimeError, ValueError, TypeError, AttributeError):
                         recheck_failed = True
-                    if recheck_failed and not _label_has_evidence(folder, group, eligible, ai_only):
+                    if recheck_failed and not _label_has_evidence(folder, group, eligible, ai_only, root=root):
                         completed += len(group)
                         continue
-                if not _label_has_evidence(folder, group, eligible, ai_only) and _low_information_mix(group, eligible):
+                if not _label_has_evidence(folder, group, eligible, ai_only, root=root) and _low_information_mix(group, eligible):
                     completed += len(group)
                     continue
-                if ai_only and not _label_has_evidence(folder, group, eligible, ai_only):
+                if ai_only and not _label_has_evidence(folder, group, eligible, ai_only, root=root):
                     folder, reason = "미분류", "분류 근거 부족"
             if folder != "미분류":
                 key = folder.replace(" ", "").casefold()
@@ -716,7 +814,7 @@ def assign_ai_folders(
                 raise InterruptedError("AI 분류가 중단되었습니다")
             positions = [position]
             items = [{"id": 0, "count": 1,
-                      "documents": [_document_hint(proposals[position][0], MAX_TEXT)]}]
+                      "documents": [_document_hint(proposals[position][0], MAX_TEXT, root)]}]
             topics = [name for name in known if name.replace(" ", "").casefold() not in type_names]
             try:
                 answers = classify(items, topics)
@@ -772,7 +870,7 @@ def assign_ai_folders(
                 for doc, folder, reason in proposals
             ]
             labelled_groups = [(group, renamed.get(name, name)) for group, name in labelled_groups]
-    subfolders = _subfolder_suggestions(eligible, labelled_groups, subdivide, should_cancel)
+    subfolders = _subfolder_suggestions(eligible, labelled_groups, subdivide, should_cancel, root)
     if progress and total:
         progress(total * 3, total * 3)
     if should_cancel and should_cancel():
@@ -806,13 +904,13 @@ def assign_ai_folders(
                     and len(doc.lead_text.strip()) < 80]
         if unplaced:
             try:
-                root = Path(os.path.commonpath([str(doc.source.parent) for doc in originals]))
+                common = Path(os.path.commonpath([str(doc.source.parent) for doc in originals]))
             except ValueError:  # 드라이브가 다르면 공통 상위 폴더가 없다.
-                root = None
+                common = None
             per_parent = Counter(doc.source.parent for doc in unplaced)
             for doc in unplaced:
                 parent = doc.source.parent
-                keep = (parent != root and per_parent[parent] >= 2
+                keep = (parent != (root or common) and per_parent[parent] >= 2
                         and valid_folder_name(parent.name) and len(parent.name) <= 40)
                 doc.folder, doc.subfolder = IMAGE_FOLDER, parent.name if keep else ""
                 doc.folder_reason = ("이미지: 주제 단서 없음 · 원래 폴더 유지" if keep

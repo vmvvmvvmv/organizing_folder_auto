@@ -7,6 +7,7 @@ import csv
 import os
 import re
 import shutil
+import stat
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -156,7 +157,9 @@ def scan(
     progress: Callable[[int, int], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
     classify: bool = True,
+    cache=None,
 ) -> list[Document]:
+    """cache(local_cache.LocalCache)를 주면 해시와 본문을 저장해 두고 다음 미리보기에서 다시 쓴다."""
     source = source.resolve()
     destination = destination.resolve()
     if not source.is_dir():
@@ -172,7 +175,7 @@ def scan(
         # 내용을 못 읽는 파일도 이동 전 검증할 수 있도록 미리보기 시점의 해시를 남긴다.
         structured = is_structured_file(path)
         try:
-            digest = _digest(path)
+            digest = cache.digest(path, _digest) if cache else _digest(path)
         except OSError as exc:
             # 다른 프로그램이 잠근 파일 하나 때문에 미리보기 전체를 멈추지 않는다.
             # 내용을 확인하지 못했으므로 이동 단계에서는 원본에 남긴다.
@@ -192,10 +195,13 @@ def scan(
                     preview_digest=digest,
                 ))
             else:
-                text, method = (
-                    read_document(path, executable) if path.suffix.lower() in SUPPORTED
-                    else ("", "파일명·형식")
-                )
+                if path.suffix.lower() not in SUPPORTED:
+                    text, method = "", "파일명·형식"
+                elif cache:
+                    text, method = cache.read(digest, bool(executable),
+                                              lambda: read_document(path, executable))
+                else:
+                    text, method = read_document(path, executable)
                 document = Document(path, "", "", method, lead_text=text[:1200], preview_digest=digest,
                                     preserve_structure=structured)
                 results.append(document)
@@ -244,6 +250,23 @@ def _digest(path: Path) -> bytes:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             checksum.update(block)
     return checksum.digest()
+
+
+def _remove(path: Path, missing_ok: bool = False) -> None:
+    """파일을 지운다. Windows 읽기 전용 속성 때문에 거부되면 속성을 풀고 다시 지운다.
+
+    옮기는 파일의 결과 사본은 copystat으로 원래 속성을 그대로 갖고 있다.
+    """
+    try:
+        path.unlink(missing_ok=missing_ok)
+    except PermissionError:
+        if not path.exists():
+            return
+        mode = path.stat().st_mode
+        if mode & stat.S_IWRITE:
+            raise  # 읽기 전용 때문이 아니다(다른 프로그램이 사용 중 등).
+        os.chmod(path, mode | stat.S_IWRITE)
+        path.unlink()
 
 
 def _available_target(folder: Path, source: Path, name: str = "") -> Path:
@@ -317,7 +340,7 @@ def _stage(source: Path, folder: Path, digest: bytes) -> Path:
         return temporary
     except BaseException:
         if temporary is not None:
-            temporary.unlink(missing_ok=True)
+            _remove(temporary, missing_ok=True)
         raise
 
 
@@ -349,15 +372,15 @@ def _move_group(
     except (OSError, ValueError) as exc:
         for _, _, _, temporary in staged:
             if temporary is not None:
-                temporary.unlink(missing_ok=True)
+                _remove(temporary, missing_ok=True)
         for target in published:
-            target.unlink(missing_ok=True)
+            _remove(target, missing_ok=True)
         message = f"{current.source.name}: {exc}. 관련 파일 묶음 전체를 원본에 유지했습니다"
         return [(document, "이동 실패", message) for document in members]
     results: list[tuple[Document, str, Path | str]] = []
     for document, _, target, temporary in staged:
         try:
-            document.source.unlink()
+            _remove(document.source)
             results.append((document, "이동" if temporary else "중복 정리", target))
         except OSError as exc:
             results.append((document, "이동 실패", f"원본 삭제 실패, 결과 폴더에 검증된 사본이 있습니다: {exc}"))
@@ -460,7 +483,7 @@ def move_documents(
                 # 기존 결과 파일이나 이번 실행에서 옮긴 파일도 다시 읽고 확인한다.
                 if _digest(source) != digest or _digest(matched) != digest:
                     raise ValueError("파일 내용이 검사 중 변경되었습니다")
-                source.unlink()
+                _remove(source)
                 finish(document, "중복 정리", matched)
                 continue
             temporary = _stage(source, folder, digest)
@@ -473,13 +496,20 @@ def move_documents(
                     except FileExistsError:
                         continue
             finally:
-                temporary.unlink(missing_ok=True)
+                _remove(temporary, missing_ok=True)
             if _digest(source) != digest or _digest(target) != digest:
-                target.unlink(missing_ok=True)
+                _remove(target, missing_ok=True)
                 raise ValueError("이동 후 내용 검증 실패: 원본을 유지했습니다")
-            # 원본 삭제에 실패하면 검증된 결과 파일과 원본을 모두 남긴다.
+            try:
+                _remove(source)
+            except OSError as exc:
+                # 원본을 못 지우면 방금 만든 사본을 지워, 기록(이동 실패)과 실제 상태를 맞춘다.
+                try:
+                    _remove(target)
+                except OSError:
+                    raise OSError(f"원본을 지울 수 없고 결과 사본도 남았습니다({target}): {exc}") from exc
+                raise OSError(f"원본을 지울 수 없어 원본을 유지했습니다(다른 프로그램이 사용 중일 수 있음): {exc}") from exc
             moved_by_digest[digest] = target
-            source.unlink()
             finish(document, "이동", target)
         except (OSError, ValueError) as exc:
             finish(document, "이동 실패", str(exc))
@@ -580,13 +610,13 @@ def undo_report(
             try:
                 temporary.rename(original)
             finally:
-                temporary.unlink(missing_ok=True)
+                _remove(temporary, missing_ok=True)
             if _digest(original) != digest:
-                original.unlink(missing_ok=True)
+                _remove(original, missing_ok=True)
                 raise ValueError("되돌린 파일 검증 실패: 결과 폴더의 파일을 유지했습니다")
             if status == "이동":
                 try:
-                    result.unlink()
+                    _remove(result)
                 except OSError as exc:
                     raise OSError(f"원래 위치에 되돌렸지만 결과 폴더의 파일을 지우지 못해 두 곳에 있습니다: {exc}") from exc
             restored.append((result, original))

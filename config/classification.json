@@ -4,7 +4,8 @@
     "목록", "검토", "안내", "안내문", "작성", "첨부", "붙임", "파일", "페이지",
     "단위", "그림", "정리", "해당", "그리고", "입니다", "합니다", "없음", "기타",
     "미분류", "scan", "image", "img", "page", "copy", "pdf", "docx", "hwpx",
-    "xlsx", "pptx", "ppt", "skm", "kakaotalk"
+    "xlsx", "pptx", "ppt", "skm", "kakaotalk",
+    "진짜최종", "최최종", "진짜", "수정본", "복사본", "캡처", "스크린샷", "스캔", "screenshot"
   ],
   "file_groups": [
     {"folder": "GIS 자료", "extensions": [".shp", ".shx", ".dbf", ".prj", ".cpg", ".geojson", ".gpkg", ".qgz", ".msld"], "preserve_structure": true},

@@ -318,7 +318,30 @@ class OrganizerTests(unittest.TestCase):
         with mock.patch("organizer.Path.unlink", new=unlink):
             moved, deduplicated, errors = move_documents([Document(source, "자료", "", "")], destination)
         self.assertEqual((len(moved), len(deduplicated), len(errors)), (0, 0, 1))
-        self.assertEqual(source.read_bytes(), (destination / "자료" / source.name).read_bytes())
+        # 원본을 못 지우면 사본을 지워 기록(이동 실패)과 실제 상태를 맞춘다.
+        self.assertEqual(source.read_bytes(), b"original document")
+        self.assertFalse((destination / "자료" / source.name).exists())
+        self.assertIn("원본을 유지", errors[0][1])
+
+    def test_read_only_original_is_moved(self):
+        source = self.folder / "source"
+        destination = self.folder / "result"
+        source.mkdir()
+        destination.mkdir()
+        path = source / "읽기전용.xyz"
+        path.write_bytes(b"read only")
+        os.chmod(path, 0o444)
+        self.addCleanup(lambda: [os.chmod(p, 0o666) for p in self.folder.rglob("*") if p.is_file()])
+        documents = scan(source, destination, None)
+        documents[0].folder = "자료"
+        with organizer.ResultReport(source, destination, documents) as report:
+            moved, _, errors = move_documents(documents, destination, source_root=source, record=report.record)
+        self.assertEqual((len(moved), errors), (1, []))
+        self.assertFalse(path.exists())
+        # 결과 사본은 읽기 전용 속성을 그대로 갖고, 되돌리기도 막히지 않는다.
+        restored, undo_errors = organizer.undo_report(report.path)
+        self.assertEqual((len(restored), undo_errors), (1, []))
+        self.assertEqual(path.read_bytes(), b"read only")
 
     def test_move_report_records_every_result_and_keeps_previous_reports(self):
         source = self.folder / "source"
