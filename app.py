@@ -118,6 +118,9 @@ class OrganizerApp(tk.Tk):
         self.drag_hover: str | None = None
         self.drag_preview: tk.Toplevel | None = None
         self.drag_preview_label: tk.Label | None = None
+        self.drag_click_item: str | None = None
+        self.drag_last: tuple[int, int, int, int] | None = None
+        self.drag_scroll_job: str | None = None
         self.preview_paths: tuple[Path, Path] | None = None
         self.last_result_dir: Path | None = None
         self.sort_key = "source"
@@ -202,9 +205,9 @@ class OrganizerApp(tk.Tk):
         self.table.bind("<Button-3>", self.on_table_right_click)
         self.table.bind("<F2>", lambda _event: self.begin_rename_selected())
         self.table.bind("<Return>", lambda _event: self.show_selected_preview())
-        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.table.yview)
-        scrollbar.grid(row=1, column=1, sticky="ns")
-        self.table.configure(yscrollcommand=scrollbar.set)
+        self.table_scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.table.yview)
+        self.table_scrollbar.grid(row=1, column=1, sticky="ns")
+        self.table.configure(yscrollcommand=self._on_table_yview)
         ttk.Label(
             table_frame, textvariable=self.detail_var, wraplength=950, justify="left", anchor="w"
         ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
@@ -422,22 +425,31 @@ class OrganizerApp(tk.Tk):
 
         threading.Thread(target=work, daemon=False).start()
 
-    def on_drag_press(self, event: tk.Event) -> None:
+    def on_drag_press(self, event: tk.Event) -> str | None:
         """마우스를 누른 파일과 기존 다중 선택 파일을 기억한다."""
         self.drag_origin = None
         self.drag_indices = []
         self.drag_active = False
+        self.drag_click_item = None
         if self.busy:
-            return
+            return None
         item = self.table.identify_row(event.y)
         pressed = selected_file_indices((item,))
         if not pressed:
-            return
+            return None
         selected = self.table.selection()
         self.drag_indices = (
             selected_file_indices(selected) if item in selected else pressed
         )
         self.drag_origin = (event.x, event.y)
+        # 여러 파일이 선택된 행을 누르면 Treeview 기본 동작이 선택을 한 행으로 줄인다.
+        # 끌기 중에는 선택을 유지하고, 끌지 않고 놓으면 그때 그 행만 선택한다.
+        if item in selected and len(self.drag_indices) > 1 and not event.state & 0x0005:
+            self.drag_click_item = item
+            self.table.focus_set()
+            self.table.focus(item)
+            return "break"
+        return None
 
     def _show_drag_target(self, item: str | None, hover: str | None = None) -> None:
         hover = hover if hover != item else None
@@ -453,7 +465,7 @@ class OrganizerApp(tk.Tk):
                 self.table.item(row, tags=base + ("drop_target",))
         self.table.configure(cursor="hand2" if item else "")
 
-    def _move_drag_preview(self, event: tk.Event, target: str | None) -> None:
+    def _move_drag_preview(self, x_root: int, y_root: int, target: str | None) -> None:
         if self.drag_preview is None:
             preview = tk.Toplevel(self)
             preview.withdraw()
@@ -478,7 +490,7 @@ class OrganizerApp(tk.Tk):
         self.drag_preview_label.configure(
             text=label, bg="#d8f2dc" if target else "#e7f1fb",
         )
-        self.drag_preview.geometry(f"+{event.x_root + 18}+{event.y_root + 18}")
+        self.drag_preview.geometry(f"+{x_root + 18}+{y_root + 18}")
         self.drag_preview.deiconify()
 
     def _hide_drag_preview(self) -> None:
@@ -495,19 +507,48 @@ class OrganizerApp(tk.Tk):
             if abs(event.x - x) + abs(event.y - y) < 6:
                 return
             self.drag_active = True
-        if event.y < 24:
-            self.table.yview_scroll(-1, "units")
-        elif event.y > self.table.winfo_height() - 24:
-            self.table.yview_scroll(1, "units")
-        row = self.table.identify_row(event.y)
+        self.drag_last = (event.x, event.y, event.x_root, event.y_root)
+        self._update_drag_target()
+        if self.drag_scroll_job is None:
+            self._drag_autoscroll()
+
+    def _update_drag_target(self) -> None:
+        x, y, x_root, y_root = self.drag_last
+        row = self.table.identify_row(y)
         target = drop_folder_row(self.table, self.folder_rows, row)
         self._show_drag_target(target, row if target else None)
-        self._move_drag_preview(event, target)
+        self._move_drag_preview(x_root, y_root, target)
+
+    def _drag_autoscroll(self) -> None:
+        """마우스를 목록 위·아래 가장자리에 멈춰 두어도 계속 스크롤한다."""
+        self.drag_scroll_job = None
+        if not self.drag_active or self.drag_last is None:
+            return
+        y = self.drag_last[1]
+        step = -1 if y < 24 else 1 if y > self.table.winfo_height() - 24 else 0
+        if not step:
+            return
+        self.table.yview_scroll(step, "units")
+        self._update_drag_target()
+        self.drag_scroll_job = self.after(60, self._drag_autoscroll)
+
+    def _stop_drag_autoscroll(self) -> None:
+        if self.drag_scroll_job is not None:
+            self.after_cancel(self.drag_scroll_job)
+            self.drag_scroll_job = None
+        self.drag_last = None
 
     def on_drag_release(self, event: tk.Event) -> str | None:
+        self._stop_drag_autoscroll()
         if not self.drag_active:
+            click_item = self.drag_click_item
             self.drag_origin = None
             self.drag_indices = []
+            self.drag_click_item = None
+            if click_item and self.table.exists(click_item):
+                # 끌지 않고 클릭만 했으면 기본 동작처럼 누른 행만 선택한다.
+                self.table.selection_set(click_item)
+                return "break"
             return None
         row = self.table.identify_row(event.y)
         target_row = drop_folder_row(self.table, self.folder_rows, row)
@@ -592,8 +633,32 @@ class OrganizerApp(tk.Tk):
             current = Path(doc.output_name or doc.source.name).stem
         self.table.see(item)
         self.table.update_idletasks()
+        if not self.table.bbox(item, "#0"):
+            return
+        entry = ttk.Entry(self.table)
+        entry.insert(0, current)
+        self.rename_entry = entry
+        self.rename_item = item
+        self._place_rename_entry()
+        entry.bind("<Return>", self.finish_rename)
+        entry.bind("<Escape>", self.cancel_rename)
+        entry.bind("<FocusOut>", self.finish_rename)
+        entry.focus_set()
+        entry.selection_range(0, "end")
+
+    def _on_table_yview(self, first: str, last: str) -> None:
+        self.table_scrollbar.set(first, last)
+        self._place_rename_entry()
+
+    def _place_rename_entry(self) -> None:
+        """이름 입력칸이 스크롤과 함께 수정 중인 행을 따라가게 한다."""
+        entry, item = self.rename_entry, self.rename_item
+        if entry is None or not item or not self.table.exists(item):
+            return
         box = self.table.bbox(item, "#0")
         if not box:
+            # 행이 화면 밖으로 나가면 입력칸도 숨긴다. 다시 보이면 제자리에 나타난다.
+            entry.place_forget()
             return
         x, y, width, height = box
         depth = 0
@@ -602,16 +667,7 @@ class OrganizerApp(tk.Tk):
             depth += 1
             parent = self.table.parent(parent)
         offset = 20 * (depth + 1)
-        entry = ttk.Entry(self.table)
-        entry.insert(0, current)
         entry.place(x=x + offset, y=y, width=max(100, width - offset), height=height)
-        self.rename_entry = entry
-        self.rename_item = item
-        entry.bind("<Return>", self.finish_rename)
-        entry.bind("<Escape>", self.cancel_rename)
-        entry.bind("<FocusOut>", self.finish_rename)
-        entry.focus_set()
-        entry.selection_range(0, "end")
 
     def cancel_rename(self, _event: tk.Event | None = None) -> str:
         entry = self.rename_entry
@@ -634,6 +690,19 @@ class OrganizerApp(tk.Tk):
             route = self.folder_rows.get(item)
             if route:
                 folder, subfolder = route
+                # 이미 있는 폴더 이름으로 바꾸면 두 폴더가 합쳐지므로 먼저 묻는다.
+                key = name.casefold()
+                if subfolder is None:
+                    existing = any(doc.folder != folder and doc.folder.casefold() == key
+                                   for doc in self.documents)
+                else:
+                    existing = any(doc.folder == folder and doc.subfolder != subfolder
+                                   and doc.subfolder.casefold() == key
+                                   for doc in self.documents)
+                if existing and not messagebox.askyesno(
+                    "폴더 합치기", f"'{name}' 폴더가 이미 있습니다. 두 폴더를 합칠까요?",
+                ):
+                    return "break"
                 if subfolder is None:
                     if name != folder:
                         rename_folder(self.documents, folder, name)

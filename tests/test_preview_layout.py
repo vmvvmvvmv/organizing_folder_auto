@@ -37,10 +37,14 @@ class PreviewLayoutTests(unittest.TestCase):
         surface.busy = False
         surface.table.identify_row.return_value = "file:2"
         surface.table.selection.return_value = ("file:1", "file:2", "folder:0")
-        handler(surface, mock.Mock(x=40, y=50))
+        # 다중 선택을 누르면 기본 선택 변경을 막아 끄는 동안 선택이 그대로 보인다.
+        self.assertEqual(handler(surface, mock.Mock(x=40, y=50, state=0)), "break")
         self.assertEqual(getattr(surface, "drag_indices", None), [1, 2])
+        self.assertEqual(surface.drag_click_item, "file:2")
+        # Ctrl/Shift 클릭은 Treeview 기본 선택 동작에 맡긴다.
+        self.assertIsNone(handler(surface, mock.Mock(x=40, y=50, state=0x0004)))
         surface.table.selection.return_value = ("file:1",)
-        handler(surface, mock.Mock(x=40, y=50))
+        self.assertIsNone(handler(surface, mock.Mock(x=40, y=50, state=0)))
         self.assertEqual(getattr(surface, "drag_indices", None), [2])
 
     def test_drop_onto_file_row_uses_its_containing_subfolder(self):
