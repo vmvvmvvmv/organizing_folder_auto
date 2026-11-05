@@ -25,7 +25,7 @@ Windows 폴더와 하위 폴더의 파일을 읽어 주제별 결과 폴더를 �
 - `auto_groups.py`, `classification_rules.py`, `config/classification.json`: AI를 끄면 쓰는 공통 단어·파일 형식 규칙.
 - `ai_groups.py`: AI 전용 분류. 임베딩 → 유사 파일 묶기 → 모델의 폴더명 제안 → 파일별 근거 확인 → 읽힌 미분류 문서 개별 재판정 → 하위 폴더 제안.
 - `app.py`: 화면, 미리보기 편집, 드래그 앤 드롭, 백그라운드 작업과 이벤트 큐.
-- `ai_hybrid.py`, `quality_eval.py`: 별도의 혼합 분류·평가 코드. 현재 GUI의 **AI 전용 경로와 동일하지 않습니다**.
+- `quality_eval.py`: GUI와 같은 AI 분류 경로(`assign_ai_folders(ai_only=True)`)를 정답 목록과 비교. `--documents`로 OCR을 건너뛰고, `--cache`로 Ollama 응답을 고정해 코드 수정 전후를 비교할 수 있습니다. (예전 `ai_hybrid.py`는 GUI에서 쓰지 않아 삭제했습니다.)
 - `batch.py`: CLI 미리보기·적용 경로. GUI의 AI 전용 흐름과 별개입니다.
 
 ```text

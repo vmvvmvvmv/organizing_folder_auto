@@ -1,6 +1,10 @@
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
-from quality_eval import score_labels
+import ai_groups
+from quality_eval import cached_ollama, score_labels
 
 
 class QualityEvalTests(unittest.TestCase):
@@ -24,6 +28,28 @@ class QualityEvalTests(unittest.TestCase):
         result = score_labels(["증빙", "인구"], ["미분류", "인구"])
         self.assertEqual(result["unclassified"], 1)
         self.assertEqual(result["folder_count"], 1)
+
+    def test_cache_replays_answers_and_errors_without_calling_ollama_again(self):
+        with tempfile.TemporaryDirectory() as folder:
+            cache = Path(folder) / "cache.json"
+            items = [{"id": 0, "documents": [], "count": 1}]
+            with mock.patch("ai_groups.ollama_classify", return_value=[("출장", "이유")]) as chat, \
+                    mock.patch("ai_groups.ollama_embeddings",
+                               side_effect=ai_groups.IncompleteResultError("누락")) as embed:
+                embed_first, classify, _subdivide, save = cached_ollama(cache)
+                with self.assertRaises(ai_groups.IncompleteResultError):
+                    embed_first(["본문"])
+                self.assertEqual(classify(items, []), [("출장", "이유")])
+                save()
+                # 새로 읽은 캐시는 Ollama를 부르지 않고 같은 응답과 오류를 돌려준다.
+                embed_again, classify_again, _, _ = cached_ollama(cache)
+                self.assertEqual(classify_again(items, []), [("출장", "이유")])
+                with self.assertRaises(ai_groups.IncompleteResultError):
+                    embed_again(["본문"])
+            self.assertEqual((chat.call_count, embed.call_count), (1, 1))
+            # 앱과 같은 AI 전용 지시문을 쓴다.
+            self.assertEqual(chat.call_args.kwargs["instructions_override"],
+                             ai_groups.AI_ONLY_INSTRUCTIONS)
 
 
 if __name__ == "__main__":
