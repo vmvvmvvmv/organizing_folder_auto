@@ -27,6 +27,8 @@ SMALL_FOLDER = 2
 MERGE_SIMILARITY = 0.8
 # 세 폴더 평가: 0.75 이상은 거의 같은 주제였고, 그 아래부터 '기능'·'기반' 같은 흔한 단어로 잘못 합쳐졌다.
 CONSOLIDATE_SIMILARITY = 0.75
+# 한국어가 적은 문서(영어 등)는 한국어 폴더명과 글자가 맞을 수 없어, 폴더명과 문서의 임베딩 유사도로 근거를 본다.
+MEANING_SIMILARITY = 0.45  # 영어 섞인 가상 사용자: 끔 F1 0.39, 0.5 0.68, 0.45 0.81(정밀도 1.0), 0.4 0.73
 
 AI_ONLY_INSTRUCTIONS = (
     "PC 파일 묶음마다 짧은 folder와 reason을 JSON으로 반환한다. "
@@ -274,6 +276,15 @@ def _clean_text(text: str) -> str:
         return text
     sentences = re.split(r"(?<=[.!?。\n])\s*", text)
     return " ".join(sentence for sentence in sentences if not INSTRUCTION_LIKE.search(sentence)).strip()
+
+
+def _mostly_foreign(doc: Document) -> bool:
+    """본문 글자의 30% 미만이 한글인 문서(영어 문서 등). 이런 문서는 글자 비교 대신 의미로 근거를 본다.
+
+    본문이 없는 파일(영어 파일명의 동영상 등)은 파일명만으로 주제를 정하지 않도록 제외한다.
+    """
+    letters = re.findall(r"[가-힣A-Za-z]", doc.lead_text)
+    return len(letters) >= 40 and sum("가" <= letter <= "힣" for letter in letters) < len(letters) * 0.3
 
 
 def _context(doc: Document, root: Path | None) -> list[str]:
@@ -676,6 +687,20 @@ def assign_ai_folders(
         if progress:
             progress(start, total * 3)
     vectors = [_unit(vector) for vector in vectors]
+    vector_of = {doc.source: vector for doc, vector in zip(eligible, vectors)}
+    name_vectors: dict[str, list[float] | None] = {}
+
+    def meaning_evidence(name: str, doc: Document) -> bool:
+        """한국어가 적은 문서에서 폴더명과 문서 내용의 뜻이 가까운지 본다."""
+        if not _mostly_foreign(doc) or doc.source not in vector_of:
+            return False
+        if name not in name_vectors:
+            try:
+                name_vectors[name] = _unit(embed([f"폴더 주제: {name}"])[0])
+            except (RuntimeError, ValueError, IndexError, TypeError):
+                name_vectors[name] = None
+        vector = name_vectors[name]
+        return vector is not None and _dot(vector, vector_of[doc.source]) >= MEANING_SIMILARITY
     if vectors and any(len(vector) != len(vectors[0]) for vector in vectors):
         raise ValueError("Ollama 임베딩 차원이 서로 다릅니다")
     groups = _cluster(vectors)
@@ -736,7 +761,10 @@ def assign_ai_folders(
                 accepted: dict[str, list[int]] = {}
                 for member in group:
                     candidate = _canonical_ai_type(folder, [member], eligible)
-                    if candidate != "미분류" and not _label_has_evidence(candidate, [member], eligible, True, root=root):
+                    if candidate != "미분류" and not (
+                        _label_has_evidence(candidate, [member], eligible, True, root=root)
+                        or meaning_evidence(candidate, eligible[member])
+                    ):
                         candidate = "미분류"
                     if candidate != "미분류":
                         key = candidate.replace(" ", "").casefold()
@@ -841,13 +869,13 @@ def assign_ai_folders(
                     continue
                 # 재판정은 기존 폴더를 고르거나, 새 이름이면 모델이 본 본문에 근거가 있어야 한다.
                 if key not in names:
-                    if not _label_has_evidence(folder, [0], [doc], text_limit=MAX_TEXT):
+                    if not (_label_has_evidence(folder, [0], [doc], text_limit=MAX_TEXT)
+                            or meaning_evidence(folder, doc)):
                         continue
                     names[key] = folder
                     known.append(folder)
                 proposals[position] = (doc, names[key], f"재판정 · {reason}")
         # 파일이 한두 개뿐인 주제 폴더는 내용이 가장 가까운 큰 폴더로 합쳐 폴더 난립을 줄인다.
-        vector_of = {doc.source: vector for doc, vector in zip(eligible, vectors)}
         matches = _small_folder_matches(proposals, vector_of, type_names)
         merged = {small: target for small, (target, score) in matches.items()
                   if score >= MERGE_SIMILARITY}

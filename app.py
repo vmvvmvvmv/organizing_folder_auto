@@ -15,6 +15,7 @@ import contextlib
 import webbrowser
 
 from quality_score import quality_check
+from ollama_setup import find_ollama, install_ollama, start_ollama, wait_until_running, winget_available
 from local_cache import LocalCache, cached_ollama, clear_cache, default_cache_path
 from ai_groups import OLLAMA_DOWNLOAD, assign_ai_folders, ollama_missing_models, ollama_pull
 from organizer import Document, default_destination, move_documents, reassign_documents, rename_document, rename_folder, rename_subfolder, scan, source_files, undo_jobs, undo_report, valid_folder_name, ResultReport
@@ -442,14 +443,29 @@ class OrganizerApp(tk.Tk):
 
     def _handle_ai_setup(self, missing: list[str], error: str) -> None:
         if error:
-            self.ai_var.set(False)
-            self.status_var.set(f"{error}. Ollama를 설치·실행한 뒤 '로컬 AI 분류'를 다시 켜세요.")
-            if messagebox.askyesno(
+            if find_ollama() is not None:
+                if messagebox.askyesno(
+                    "로컬 AI 준비", "Ollama가 설치돼 있지만 실행 중이 아닙니다. 지금 실행할까요?",
+                ):
+                    self.start_ollama_setup(install=False)
+                    return
+            elif winget_available():
+                if messagebox.askyesno(
+                    "로컬 AI 준비",
+                    "로컬 AI 분류에는 무료 프로그램 Ollama가 필요합니다.\n\n"
+                    "Windows 패키지 관리자(winget)로 공식 Ollama를 자동 설치할까요? "
+                    "(약 1GB, 인터넷 필요. Ollama 사용권에 동의하는 것으로 처리됩니다)",
+                ):
+                    self.start_ollama_setup(install=True)
+                    return
+            elif messagebox.askyesno(
                 "로컬 AI 준비",
                 f"{error}.\n\n로컬 AI 분류에는 무료 프로그램 Ollama가 필요합니다. "
                 "설치하고 실행한 뒤 다시 켜세요.\n\n다운로드 페이지를 열까요?",
             ):
                 webbrowser.open(OLLAMA_DOWNLOAD)
+            self.ai_var.set(False)
+            self.status_var.set(f"{error}. Ollama를 설치·실행한 뒤 '로컬 AI 분류'를 다시 켜세요.")
             return
         if not missing:
             self.status_var.set("로컬 AI 사용 가능")
@@ -463,6 +479,37 @@ class OrganizerApp(tk.Tk):
         else:
             self.ai_var.set(False)
             self.status_var.set("AI 모델이 없어 로컬 AI 분류를 껐습니다")
+
+    def start_ollama_setup(self, install: bool) -> None:
+        """Ollama를 설치(필요하면)하고 실행한 뒤, 이어서 모델 확인 단계로 넘어간다."""
+        self.cancel_event.clear()
+        self._set_busy(True)
+        self.status_var.set("Ollama를 설치하는 중입니다…" if install else "Ollama를 실행하는 중입니다…")
+
+        def running() -> bool:
+            try:
+                ollama_missing_models(timeout=2)
+                return True
+            except RuntimeError:
+                return False
+
+        def work() -> None:
+            try:
+                if install:
+                    install_ollama(lambda line: self.events.put(("progress", f"Ollama 설치 중: {line}")),
+                                   should_cancel=self.cancel_event.is_set)
+                    # 설치 프로그램이 Ollama를 바로 띄우는 경우가 많아 잠시 기다려 본다.
+                    if not wait_until_running(running, timeout=15):
+                        start_ollama(running)
+                else:
+                    start_ollama(running)
+                self.events.put(("ollama_ready", ""))
+            except InterruptedError as exc:
+                self.events.put(("ollama_ready", str(exc)))
+            except (OSError, RuntimeError) as exc:
+                self.events.put(("ollama_ready", str(exc)))
+
+        threading.Thread(target=work, daemon=False).start()
 
     def start_model_pull(self, models: list[str]) -> None:
         self.cancel_event.clear()
@@ -1147,6 +1194,17 @@ class OrganizerApp(tk.Tk):
                         )
                 elif kind == "ai_setup":
                     self._handle_ai_setup(event[1], event[2])
+                elif kind == "ollama_ready":
+                    self._set_busy(False)
+                    if event[1]:
+                        self.ai_var.set(False)
+                        self.status_var.set(event[1])
+                        if not self.close_requested:
+                            messagebox.showerror("로컬 AI 준비", event[1])
+                    else:
+                        # 실행되면 바로 모델 확인으로 이어서, 없으면 받기를 묻는다.
+                        self.status_var.set("Ollama가 실행되었습니다. AI 모델을 확인하는 중입니다…")
+                        self.on_ai_toggle()
                 elif kind == "pulled":
                     self._set_busy(False)
                     if event[1]:
