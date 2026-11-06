@@ -91,6 +91,35 @@ class HierarchyTests(unittest.TestCase):
         # '업무 운영'·'기술'처럼 넓은 말뿐인 이름은 안에 무엇이 있는지 알 수 없어 고를 수 없다.
         self.assertEqual(seen[0], ["채용 서류", "지출 정산"])
 
+    def test_big_top_level_gets_middle_level(self):
+        # 대분류 '채용' 안에 세부 주제 8개 → 중분류 2개로 한 번 더 나눈다. '재무'는 주제 8개 중 2개만 남아 두 단계.
+        hiring = {f"채용{i}": 3 for i in range(8)}
+        finance = {f"정산{i}": 3 for i in range(8)}
+        docs = docs_for(hiring | finance | {"정산작은것": 1})
+        calls = []
+
+        def taxonomy(folders, minimum, maximum, parent=""):
+            calls.append(parent)
+            # 중분류 앞에 대분류 이름을 붙여 와도 떼어 낸다.
+            return {"": ["채용 서류", "지출 정산"],
+                    "채용 서류": ["채용 서류_입사지원서", "면접 기록"]}.get(parent, [])
+
+        def pick(items, categories):
+            if "입사지원서" in categories:
+                return ["입사지원서" if int(row["folder"][-1]) < 4 else "면접 기록" for row in items]
+            return ["채용 서류" if row["folder"].startswith("채용") else "지출 정산" for row in items]
+
+        middles = {}
+        plan = add_top_level(docs, taxonomy, pick, embed=None, middles=middles)
+        self.assertEqual(calls, ["", "지출 정산", "채용 서류"])  # 지출 정산은 중분류 이름을 못 받음
+        self.assertEqual(middles["채용0"], "입사지원서")
+        routes = {(doc.folder, doc.subfolder, doc.detail) for doc in docs}
+        self.assertIn(("채용 서류", "입사지원서", "채용0"), routes)
+        self.assertIn(("채용 서류", "면접 기록", "채용7"), routes)
+        self.assertIn(("지출 정산", "정산3", ""), routes)  # 중분류가 없으면 대분류 / 세부 주제
+        self.assertIn(("지출 정산", "", ""), routes)  # 파일 1개짜리 주제는 대분류에 바로
+        self.assertEqual(len(plan), 17)
+
     def test_category_count_grows_with_topic_count(self):
         self.assertEqual(category_range(6), (3, 4))
         self.assertEqual(category_range(30), (3, 8))

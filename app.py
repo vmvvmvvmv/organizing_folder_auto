@@ -21,7 +21,7 @@ from ai_hierarchy import FORMAT_FOLDERS as HIERARCHY_FORMAT_FOLDERS, MIN_TOPICS,
 from ollama_setup import find_ollama, install_ollama, start_ollama, wait_until_running, winget_available
 from local_cache import LocalCache, cached_hierarchy, cached_ollama, clear_cache, default_cache_path
 from ai_groups import OLLAMA_DOWNLOAD, assign_ai_folders, ollama_missing_models, ollama_pull
-from organizer import Document, default_destination, move_documents, reassign_documents, rename_document, rename_folder, rename_subfolder, scan, source_files, undo_jobs, undo_report, valid_folder_name, ResultReport
+from organizer import Document, default_destination, move_documents, reassign_documents, rename_document, rename_detail, rename_folder, rename_subfolder, route, scan, source_files, undo_jobs, undo_report, valid_folder_name, ResultReport
 from reader import IMAGE_TYPES, MAX_FILE_BYTES, SUPPORTED, find_tesseract, ocr_status
 
 CONFIRM_BEFORE_OPEN = {
@@ -74,9 +74,9 @@ def progress_reporter(events: queue.Queue, label: str) -> Callable[[int, int], N
     started = time.monotonic()
     return lambda done, total: events.put(("progress", progress_text(label, started, done, total)))
 
-def group_preview_documents(documents: list[Document], mode: str) -> dict[str, dict[str, list[int]]]:
-    """현재 필터의 파일을 주제와 하위 폴더별로 묶는다."""
-    groups: dict[str, dict[str, list[int]]] = {}
+def group_preview_documents(documents: list[Document], mode: str) -> dict[tuple[str, ...], list[int]]:
+    """현재 필터의 파일을 폴더 경로((대분류,), (대분류, 중분류), (대분류, 중분류, 소분류))별로 묶는다."""
+    groups: dict[tuple[str, ...], list[int]] = {}
     for index, doc in enumerate(documents):
         visible = (
             mode == "전체"
@@ -86,7 +86,8 @@ def group_preview_documents(documents: list[Document], mode: str) -> dict[str, d
             or (mode == "파일명 기준" and doc.source.suffix.lower() not in SUPPORTED)
         )
         if visible:
-            groups.setdefault(doc.folder or "미분류", {}).setdefault(doc.subfolder, []).append(index)
+            path = route(doc) if doc.folder else ("미분류",)
+            groups.setdefault(path, []).append(index)
     return groups
 
 
@@ -104,7 +105,7 @@ def selected_file_indices(items: tuple[str, ...]) -> list[int]:
     return [int(item[5:]) for item in items if item.startswith("file:") and item[5:].isdigit()]
 
 def drop_folder_row(
-    table: ttk.Treeview, folder_rows: dict[str, tuple[str, str | None]], item: str,
+    table: ttk.Treeview, folder_rows: dict[str, tuple[str, ...]], item: str,
 ) -> str | None:
     """폴더 안의 파일 행에 놓아도 가장 가까운 부모 폴더를 대상으로 삼는다."""
     while item:
@@ -114,14 +115,17 @@ def drop_folder_row(
     return None
 
 
+def in_folder(doc: Document, path: tuple[str, ...]) -> bool:
+    """파일이 그 폴더 경로 안(아래 단계 포함)에 들어가는지."""
+    return route(doc)[:len(path)] == path
+
+
 def preview_selection(
-    documents: list[Document], folder_rows: dict[str, tuple[str, str | None]], item: str,
+    documents: list[Document], folder_rows: dict[str, tuple[str, ...]], item: str,
 ) -> list[Document]:
     """선택한 파일 또는 제안 폴더에 들어갈 파일을 돌려준다."""
     if item in folder_rows:
-        folder, subfolder = folder_rows[item]
-        return [doc for doc in documents
-                if doc.folder == folder and (subfolder is None or doc.subfolder == subfolder)]
+        return [doc for doc in documents if in_folder(doc, folder_rows[item])]
     indices = selected_file_indices((item,))
     return [documents[indices[0]]] if indices and indices[0] < len(documents) else []
 
@@ -146,7 +150,7 @@ class OrganizerApp(tk.Tk):
         self.geometry("1060x650")
         self.minsize(780, 480)
         self.documents: list[Document] = []
-        self.folder_rows: dict[str, tuple[str, str | None]] = {}
+        self.folder_rows: dict[str, tuple[str, ...]] = {}
         self.drag_origin: tuple[int, int] | None = None
         self.drag_indices: list[int] = []
         self.drag_active = False
@@ -178,7 +182,7 @@ class OrganizerApp(tk.Tk):
         self.context_item: str | None = None
         self.ai_var = tk.BooleanVar(value=False)
         # 대분류로 묶기 전의 (폴더, 하위 폴더, 분류 이유). 묶기를 풀 때 되돌린다.
-        self.grouped_snapshot: list[tuple[str, str, str]] | None = None
+        self.grouped_snapshot: list[tuple[str, str, str, str]] | None = None
         self.cache_var = tk.BooleanVar(value=True)
 
         frame = ttk.Frame(self, padding=14)
@@ -306,31 +310,33 @@ class OrganizerApp(tk.Tk):
         self.refresh_table()
 
     def set_all_folders_open(self, opened: bool) -> None:
-        for top in self.table.get_children(""):
-            self.table.item(top, open=opened)
-            for child in self.table.get_children(top):
-                if child in self.folder_rows:
-                    self.table.item(child, open=opened)
+        for item in self.folder_rows:
+            self.table.item(item, open=opened)
 
     def refresh_table(self) -> None:
         selected = set(self.table.selection())
-        selected_folders = {self.folder_rows[item] for item in selected if item in self.folder_rows}
-        open_folders = {
-            name for item, name in self.folder_rows.items() if self.table.item(item, "open")
-        }
+        selected_paths = {self.folder_rows[item] for item in selected if item in self.folder_rows}
+        open_paths = {path for item, path in self.folder_rows.items() if self.table.item(item, "open")}
         self.table.delete(*self.table.get_children())
         self.folder_rows.clear()
-        groups = group_preview_documents(self.documents, self.filter_var.get())
+        routes = group_preview_documents(self.documents, self.filter_var.get())
         source_root = self.preview_paths[0] if self.preview_paths else Path(self.source_var.get() or ".")
         keys = {
             "category": lambda doc: (doc.folder.casefold(), (doc.output_name or doc.source.name).casefold()),
             "source": lambda doc: ((doc.output_name or doc.source.name).casefold(), str(doc.source).casefold()),
             "method": lambda doc: ((doc.error or doc.method).casefold(), doc.source.name.casefold()),
         }
-        folders = sorted(
-            groups, key=lambda name: (name != "미분류", name.casefold()),
-            reverse=self.sort_reverse if self.sort_key == "category" else False,
-        )
+        # 폴더 경로마다 바로 들어 있는 파일, 바로 아래 폴더, 아래 단계까지 합한 파일 수를 센다.
+        children: dict[tuple[str, ...], set[str]] = {}
+        totals: dict[tuple[str, ...], int] = {}
+        selected_under: set[tuple[str, ...]] = set()
+        for path, indices in routes.items():
+            has_selected = any(f"file:{index}" in selected for index in indices)
+            for depth in range(1, len(path) + 1):
+                children.setdefault(path[:depth - 1], set()).add(path[depth - 1])
+                totals[path[:depth]] = totals.get(path[:depth], 0) + len(indices)
+                if has_selected:
+                    selected_under.add(path[:depth])
         restore = []
 
         def insert_files(parent: str, indices: list[int]) -> None:
@@ -349,47 +355,28 @@ class OrganizerApp(tk.Tk):
                 if file_item in selected:
                     restore.append(file_item)
 
-        for position, folder in enumerate(folders):
-            children = groups[folder]
-            all_indices = [index for indices in children.values() for index in indices]
-            folder_item = f"folder:{position}"
-            top_key = (folder, None)
-            self.folder_rows[folder_item] = top_key
-            opened = (
-                top_key in open_folders or len(groups) == 1
-                or any(f"file:{index}" in selected for index in all_indices)
-            )
-            self.table.insert(
-                "", "end", iid=folder_item, text=f"{folder}  ({len(all_indices)}개)",
-                values=("", ""), open=opened, tags=("folder",),
-            )
-            if top_key in selected_folders:
-                restore.append(folder_item)
-            insert_files(folder_item, children.get("", []))
-            for child_position, subfolder in enumerate(
-                sorted(name for name in children if name)
-            ):
-                indices = children[subfolder]
-                child_item = f"sub:{position}:{child_position}"
-                child_key = (folder, subfolder)
-                self.folder_rows[child_item] = child_key
-                child_open = (
-                    child_key in open_folders
-                    or any(f"file:{index}" in selected for index in indices)
-                )
-                self.table.insert(
-                    folder_item, "end", iid=child_item,
-                    text=f"{subfolder}  ({len(indices)}개)",
-                    values=("", ""), open=child_open, tags=("folder",),
-                )
-                if child_key in selected_folders:
-                    restore.append(child_item)
-                insert_files(child_item, indices)
+        top_names = children.get((), set())
+
+        def insert_folder(parent: str, path: tuple[str, ...]) -> None:
+            item = f"folder:{len(self.folder_rows)}"
+            self.folder_rows[item] = path
+            opened = (path in open_paths or path in selected_under
+                      or (len(path) == 1 and len(top_names) == 1))
+            self.table.insert(parent, "end", iid=item, text=f"{path[-1]}  ({totals[path]}개)",
+                              values=("", ""), open=opened, tags=("folder",))
+            if path in selected_paths:
+                restore.append(item)
+            insert_files(item, routes.get(path, []))
+            for name in sorted(children.get(path, set()), key=str.casefold):
+                insert_folder(item, path + (name,))
+
+        for name in sorted(top_names, key=lambda name: (name != "미분류", name.casefold()),
+                           reverse=self.sort_reverse if self.sort_key == "category" else False):
+            insert_folder("", (name,))
         if restore:
             self.table.selection_set(restore)
-        count = sum(len(indices) for children in groups.values() for indices in children.values())
-        folder_count = sum(1 + sum(bool(name) for name in children) for children in groups.values())
-        self.count_var.set(f"{folder_count}개 폴더 · {count}/{len(self.documents)}개 파일")
+        count = sum(len(indices) for indices in routes.values())
+        self.count_var.set(f"{len(self.folder_rows)}개 폴더 · {count}/{len(self.documents)}개 파일")
         if not restore:
             self.detail_var.set("")
 
@@ -588,8 +575,8 @@ class OrganizerApp(tk.Tk):
                 "대분류 풀기", "대분류를 풀면 묶은 뒤 바꾼 분류도 묶기 전 상태로 돌아갑니다. 풀까요?",
             ):
                 return
-            for doc, (folder, subfolder, reason) in zip(self.documents, self.grouped_snapshot):
-                doc.folder, doc.subfolder, doc.folder_reason = folder, subfolder, reason
+            for doc, (folder, subfolder, detail, reason) in zip(self.documents, self.grouped_snapshot):
+                doc.folder, doc.subfolder, doc.detail, doc.folder_reason = folder, subfolder, detail, reason
             self.grouped_snapshot = None
             self.group_button.configure(text="대분류로 묶기")
             self.refresh_table()
@@ -602,7 +589,7 @@ class OrganizerApp(tk.Tk):
                 "대분류로 묶기",
                 f"주제 폴더가 {len(topics)}개라 이미 한눈에 보입니다. {MIN_TOPICS}개 이상일 때 묶습니다.")
             return
-        snapshot = [(doc.folder, doc.subfolder, doc.folder_reason) for doc in self.documents]
+        snapshot = [(doc.folder, doc.subfolder, doc.detail, doc.folder_reason) for doc in self.documents]
         documents = copy.deepcopy(self.documents)  # 작업 스레드는 사본만 고친다.
         use_cache = self.cache_var.get()
         self.cancel_event.clear()
@@ -743,9 +730,7 @@ class OrganizerApp(tk.Tk):
         else:
             label = f"{len(self.drag_indices)}개 파일"
         if target:
-            folder, subfolder = self.folder_rows[target]
-            destination = folder if not subfolder else f"{folder} / {subfolder}"
-            label += f"  →  {destination}"
+            label += f"  →  {' / '.join(self.folder_rows[target])}"
         self.drag_preview_label.configure(
             text=label, bg="#d8f2dc" if target else "#e7f1fb",
         )
@@ -821,11 +806,10 @@ class OrganizerApp(tk.Tk):
         if not target or self.busy:
             self.status_var.set("폴더 안에 놓으세요")
             return "break"
-        folder, subfolder = target
-        changed = reassign_documents(self.documents, indices, folder, subfolder or "")
+        folder, subfolder, detail = (*target, "", "")[:3]
+        changed = reassign_documents(self.documents, indices, folder, subfolder, detail)
         self.refresh_table()
-        display = folder if not subfolder else f"{folder} / {subfolder}"
-        self.status_var.set(f"{len(changed)}개 파일 → {display}")
+        self.status_var.set(f"{len(changed)}개 파일 → {' / '.join(target)}")
         return "break"
 
     def on_table_double_click(self, event: tk.Event) -> str | None:
@@ -878,9 +862,9 @@ class OrganizerApp(tk.Tk):
         if self.busy or not self.table.exists(item):
             return
         self.cancel_rename()
-        route = self.folder_rows.get(item)
-        if route:
-            current = route[0] if route[1] is None else route[1]
+        path = self.folder_rows.get(item)
+        if path:
+            current = path[-1]
         else:
             indices = selected_file_indices((item,))
             if not indices:
@@ -946,30 +930,26 @@ class OrganizerApp(tk.Tk):
         if not name or not item:
             return "break"
         try:
-            route = self.folder_rows.get(item)
-            if route:
-                folder, subfolder = route
-                # 이미 있는 폴더 이름으로 바꾸면 두 폴더가 합쳐지므로 먼저 묻는다.
-                key = name.casefold()
-                if subfolder is None:
-                    existing = any(doc.folder != folder and doc.folder.casefold() == key
-                                   for doc in self.documents)
-                else:
-                    existing = any(doc.folder == folder and doc.subfolder != subfolder
-                                   and doc.subfolder.casefold() == key
-                                   for doc in self.documents)
+            path = self.folder_rows.get(item)
+            if path:
+                # 같은 위치에 이미 있는 폴더 이름으로 바꾸면 두 폴더가 합쳐지므로 먼저 묻는다.
+                key, depth = name.casefold(), len(path)
+                existing = any(
+                    len(route(doc)) >= depth and route(doc)[:depth - 1] == path[:-1]
+                    and route(doc)[depth - 1] != path[-1] and route(doc)[depth - 1].casefold() == key
+                    for doc in self.documents)
                 if existing and not messagebox.askyesno(
                     "폴더 합치기", f"'{name}' 폴더가 이미 있습니다. 두 폴더를 합칠까요?",
                 ):
                     return "break"
-                if subfolder is None:
-                    if name != folder:
-                        rename_folder(self.documents, folder, name)
-                    new_route = (name, None)
-                else:
-                    if name != subfolder:
-                        rename_subfolder(self.documents, folder, subfolder, name)
-                    new_route = (folder, name)
+                if name != path[-1]:
+                    if depth == 1:
+                        rename_folder(self.documents, path[0], name)
+                    elif depth == 2:
+                        rename_subfolder(self.documents, path[0], path[1], name)
+                    else:
+                        rename_detail(self.documents, path[0], path[1], path[2], name)
+                new_route = path[:-1] + (name,)
             else:
                 indices = selected_file_indices((item,))
                 if not indices:
@@ -1026,13 +1006,9 @@ class OrganizerApp(tk.Tk):
             return
         item = selected[0]
         if item in self.folder_rows:
-            folder, subfolder = self.folder_rows[item]
-            count = sum(
-                doc.folder == folder and (subfolder is None or doc.subfolder == subfolder)
-                for doc in self.documents
-            )
-            display = folder if subfolder is None else f"{folder} / {subfolder}"
-            self.detail_var.set(f"폴더: {display} · {count}개 파일")
+            path = self.folder_rows[item]
+            count = sum(in_folder(doc, path) for doc in self.documents)
+            self.detail_var.set(f"폴더: {' / '.join(path)} · {count}개 파일")
             return
         indices = selected_file_indices((item,))
         if indices:
@@ -1105,7 +1081,7 @@ class OrganizerApp(tk.Tk):
             doc = selected[0]
             body.insert("end", f"원본: {doc.source}\n정리할 폴더: {doc.folder}")
             if doc.subfolder:
-                body.insert("end", f" / {doc.subfolder}")
+                body.insert("end", f" / {doc.subfolder}" + (f" / {doc.detail}" if doc.detail else ""))
             if doc.output_name:
                 body.insert("end", f"\n정리할 이름: {doc.output_name}")
             body.insert("end", f"\n분류 조건: {doc.folder_reason}\n읽기 방식: {doc.method}\n")

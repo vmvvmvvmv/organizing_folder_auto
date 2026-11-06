@@ -40,6 +40,14 @@ class Document:
     subfolder: str = ""
     preserve_structure: bool = False
     output_name: str = ""
+    detail: str = ""  # 소분류(대분류 / 중분류 / 소분류의 세 번째 단계)
+
+
+def route(doc: Document) -> tuple[str, ...]:
+    """파일이 들어갈 폴더 경로: (대분류,), (대분류, 중분류), (대분류, 중분류, 소분류)."""
+    if not doc.subfolder:
+        return (doc.folder,)
+    return (doc.folder, doc.subfolder, doc.detail) if doc.detail else (doc.folder, doc.subfolder)
 
 
 def valid_folder_name(name: str) -> bool:
@@ -65,10 +73,11 @@ def rename_document(document: Document, new_name: str) -> None:
 
 
 def reassign_documents(
-    documents: list[Document], indices: list[int], folder: str, subfolder: str,
+    documents: list[Document], indices: list[int], folder: str, subfolder: str, detail: str = "",
 ) -> list[int]:
     """미리보기 분류만 바꾼다. 중복본과 함께 보관할 구성 파일도 같이 바꾼다."""
-    if not valid_folder_name(folder) or (subfolder and not valid_folder_name(subfolder)):
+    if (not valid_folder_name(folder) or (subfolder and not valid_folder_name(subfolder))
+            or (detail and (not subfolder or not valid_folder_name(detail)))):
         raise ValueError("사용할 수 없는 폴더 이름입니다")
     selected = [documents[index] for index in indices]
     originals = {doc.duplicate_of or doc.source for doc in selected}
@@ -81,9 +90,10 @@ def reassign_documents(
         key = (doc.source.parent, type_folder(doc.source))
         if ((doc.duplicate_of or doc.source) in originals
                 or ((doc.preserve_structure or is_structured_file(doc.source)) and key in related)):
-            if (doc.folder, doc.subfolder) != (folder, subfolder):
+            if (doc.folder, doc.subfolder, doc.detail) != (folder, subfolder, detail):
                 doc.folder = folder
                 doc.subfolder = subfolder
+                doc.detail = detail
                 doc.folder_reason = "사용자 지정"
                 changed.append(index)
     return changed
@@ -109,6 +119,23 @@ def rename_subfolder(documents: list[Document], folder: str, old_name: str, new_
     for index, document in enumerate(documents):
         if document.folder == folder and document.subfolder == old_name:
             document.subfolder = new_name
+            if not new_name:
+                document.detail = ""  # 상위로 합치면 그 아래 소분류도 함께 없앤다.
+            document.folder_reason = "사용자 지정"
+            changed.append(index)
+    return changed
+
+
+def rename_detail(
+    documents: list[Document], folder: str, subfolder: str, old_name: str, new_name: str,
+) -> list[int]:
+    """중분류 안의 소분류 이름만 바꾼다. 빈 이름은 중분류로 합친다."""
+    if new_name and not valid_folder_name(new_name):
+        raise ValueError(f"사용할 수 없는 소분류 이름: {new_name}")
+    changed = []
+    for index, document in enumerate(documents):
+        if (document.folder, document.subfolder, document.detail) == (folder, subfolder, old_name):
+            document.detail = new_name
             document.folder_reason = "사용자 지정"
             changed.append(index)
     return changed
@@ -241,6 +268,7 @@ def scan(
             original = by_source[doc.duplicate_of]
             doc.folder, doc.folder_reason = original.folder, original.folder_reason
             doc.subfolder = original.subfolder
+            doc.detail = original.detail
     return results
 
 
@@ -279,9 +307,9 @@ def _available_target(folder: Path, source: Path, name: str = "") -> Path:
     return target
 
 
-def _structured_group(document: Document) -> tuple[str, str, Path] | None:
+def _structured_group(document: Document) -> tuple[str, str, str, Path] | None:
     if document.preserve_structure or is_structured_file(document.source):
-        return document.folder, document.subfolder, document.source.parent
+        return document.folder, document.subfolder, document.detail, document.source.parent
     return None
 
 
@@ -289,6 +317,8 @@ def _target_folder(document: Document, destination: Path, source_root: Path | No
     folder = destination / document.folder
     if document.subfolder:
         folder /= document.subfolder
+        if document.detail:
+            folder /= document.detail
     if _structured_group(document) and source_root:
         folder /= document.source.parent.relative_to(source_root)
     # 하위 폴더를 만들기 전에 기존 심볼릭 링크가 결과 폴더 밖을 가리키는지 확인한다.
@@ -305,6 +335,8 @@ def _prepare(document: Document, destination: Path, source_root: Path | None) ->
         raise ValueError(f"사용할 수 없는 폴더 이름: {document.folder}")
     if document.subfolder and not valid_folder_name(document.subfolder):
         raise ValueError(f"사용할 수 없는 하위 폴더 이름: {document.subfolder}")
+    if document.detail and (not document.subfolder or not valid_folder_name(document.detail)):
+        raise ValueError(f"사용할 수 없는 소분류 이름: {document.detail}")
     source = document.source
     if document.output_name and (
         not valid_folder_name(document.output_name)
@@ -437,17 +469,17 @@ def move_documents(
         return folder_files[folder]
 
     # GIS/프로그램 구성 파일은 원래 같은 폴더에 있던 묶음을 다른 결과 경로로 나누지 않는다.
-    structured_routes: dict[tuple[Path, str], set[tuple[str, str]]] = {}
+    structured_routes: dict[tuple[Path, str], set[tuple[str, str, str]]] = {}
     for document in documents:
         if _structured_group(document):
             key = (document.source.parent, type_folder(document.source))
             structured_routes.setdefault(key, set()).add(
-                (document.folder, document.subfolder)
+                (document.folder, document.subfolder, document.detail)
             )
     if any(len(routes) > 1 for routes in structured_routes.values()):
         raise ValueError("관련 구성 파일의 폴더가 서로 다릅니다. 같은 결과 폴더로 지정하세요")
 
-    groups: dict[tuple[str, str, Path], list[Document]] = {}
+    groups: dict[tuple[str, str, str, Path], list[Document]] = {}
     singles: list[Document] = []
     for document in documents:
         if group := _structured_group(document):
@@ -547,7 +579,7 @@ class ResultReport:
         result, error = (str(value), "") if isinstance(value, Path) else ("", value)
         self._write((
             str(doc.source.relative_to(self.source)),
-            f"{doc.folder}/{doc.subfolder}" if doc.subfolder else doc.folder, status,
+            "/".join(route(doc)), status,
             result, doc.folder_reason, doc.method, doc.error, error, str(doc.source.absolute()),
         ))
 

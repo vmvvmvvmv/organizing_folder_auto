@@ -16,7 +16,7 @@ class FilePreviewTests(unittest.TestCase):
             Document(Path("root/b.pdf"), "출장", "", "PDF 텍스트", subfolder="2026"),
             Document(Path("root/c.pdf"), "회의", "", "PDF 텍스트"),
         ]
-        rows = {"folder:0": ("출장", None), "sub:0:0": ("출장", "2025")}
+        rows = {"folder:0": ("출장",), "sub:0:0": ("출장", "2025")}
         select = getattr(app, "preview_selection", lambda *args: [])
         self.assertEqual(select(docs, rows, "file:1"), [docs[1]])
         self.assertEqual(select(docs, rows, "folder:0"), docs[:2])

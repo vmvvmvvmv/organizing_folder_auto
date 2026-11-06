@@ -446,6 +446,33 @@ class OrganizerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "원래 위치 정보"):
             organizer.undo_report(report)
 
+    def test_three_level_route_moves_records_and_undoes(self):
+        source = self.folder / "source"
+        destination = self.folder / "result"
+        source.mkdir()
+        destination.mkdir()
+        (source / "지원서.xyz").write_bytes(b"cv")
+        documents = scan(source, destination, None)
+        organizer.reassign_documents(documents, [0], "채용 서류", "입사지원서", "2026 공채")
+        with organizer.ResultReport(source, destination, documents) as report:
+            moved, _, errors = move_documents(documents, destination, source_root=source, record=report.record)
+        self.assertEqual(errors, [])
+        self.assertEqual(moved[0][1], destination / "채용 서류" / "입사지원서" / "2026 공채" / "지원서.xyz")
+        with report.path.open(encoding="utf-8-sig", newline="") as stream:
+            self.assertEqual(next(csv.DictReader(stream))["폴더"], "채용 서류/입사지원서/2026 공채")
+        restored, undo_errors = organizer.undo_report(report.path)
+        self.assertEqual((len(restored), undo_errors), (1, []))
+        self.assertTrue((source / "지원서.xyz").exists())
+
+    def test_detail_rename_and_invalid_detail(self):
+        docs = [Document(Path("a.pdf"), "채용", "", "", subfolder="면접", detail="1차")]
+        self.assertEqual(organizer.rename_detail(docs, "채용", "면접", "1차", "2차"), [0])
+        self.assertEqual(docs[0].detail, "2차")
+        organizer.rename_subfolder(docs, "채용", "면접", "")  # 중분류를 없애면 소분류도 없어진다
+        self.assertEqual((docs[0].subfolder, docs[0].detail), ("", ""))
+        with self.assertRaises(ValueError):
+            organizer.reassign_documents(docs, [0], "채용", "", "소분류만")  # 중분류 없이 소분류 불가
+
     def test_report_keeps_finished_rows_when_move_crashes(self):
         source = self.folder / "source"
         destination = self.folder / "result"

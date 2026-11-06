@@ -911,6 +911,7 @@ def assign_ai_folders(
 
     # 오류나 중단 중에는 기존 미리보기를 건드리지 않는다.
     for doc in originals:
+        doc.detail = ""  # 소분류는 대분류로 묶을 때만 생긴다.
         if ai_only:
             doc.folder = "미분류"
             doc.subfolder = ""
@@ -977,6 +978,7 @@ def assign_ai_folders(
             original = by_source[doc.duplicate_of]
             doc.folder = original.folder
             doc.subfolder = original.subfolder
+            doc.detail = original.detail
             doc.folder_reason = original.folder_reason
     return (sum(doc.folder != "미분류" for doc in originals) if ai_only
             else sum(folder != "미분류" for _, folder, _ in proposals))

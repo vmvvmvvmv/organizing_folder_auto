@@ -45,7 +45,7 @@ class GuiInteractionTests(unittest.TestCase):
         x, y = self.point("file:32")
         self.send("<ButtonPress-1>", x, y)
         self.assertEqual(self.table.selection(), ("file:31", "file:32", "file:33"))
-        target = next(row for row, route in self.app.folder_rows.items() if route == ("출장", None))
+        target = next(row for row, route in self.app.folder_rows.items() if route == ("출장",))
         tx, ty = self.point(target)
         self.send("<B1-Motion>", tx, ty, state=0x100)
         self.send("<ButtonRelease-1>", tx, ty, state=0x100)
@@ -153,8 +153,26 @@ class GuiInteractionTests(unittest.TestCase):
         self.assertIn("이미 한눈에", info.call_args.args[1])
         self.assertFalse(self.app.busy)
 
+    def test_three_level_tree_and_drop_into_detail_folder(self):
+        docs = self.app.documents
+        docs[0].folder, docs[0].subfolder, docs[0].detail = "채용", "면접", "1차"
+        docs[1].folder, docs[1].subfolder = "채용", "면접"
+        self.app.refresh_table()
+        paths = set(self.app.folder_rows.values())
+        self.assertTrue({("채용",), ("채용", "면접"), ("채용", "면접", "1차")} <= paths)
+        detail_row = next(row for row, path in self.app.folder_rows.items() if path == ("채용", "면접", "1차"))
+        self.assertTrue(self.table.item(detail_row, "text").startswith("1차  (1개)"))
+        self.table.selection_set(("file:5",))
+        x, y = self.point("file:5")
+        self.send("<ButtonPress-1>", x, y)
+        tx, ty = self.point(detail_row)
+        self.send("<B1-Motion>", tx, ty, state=0x100)
+        self.send("<ButtonRelease-1>", tx, ty, state=0x100)
+        moved = self.app.documents[5]
+        self.assertEqual((moved.folder, moved.subfolder, moved.detail), ("채용", "면접", "1차"))
+
     def rename_folder_to(self, old, new, answer):
-        row = next(item for item, route in self.app.folder_rows.items() if route == (old, None))
+        row = next(item for item, route in self.app.folder_rows.items() if route == (old,))
         with mock.patch.object(messagebox, "askyesno", return_value=answer) as ask:
             self.app.begin_rename(row)
             self.app.rename_entry.delete(0, "end")

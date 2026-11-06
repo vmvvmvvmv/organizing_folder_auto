@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 from auto_groups import VAGUE_WORDS, _tokens, is_vague_name
 from classification_rules import TYPE_FOLDERS
-from organizer import Document
+from organizer import Document, route
 
 FORMAT_FOLDERS = {*TYPE_FOLDERS.values(), "GIS 자료", "버전 관리 설정", "사진·이미지"}
 WEIGHTS = {"기능 기준": 15, "최상위 폴더 수": 15, "하위 폴더 수": 10, "작은 폴더 적음": 15,
@@ -51,8 +51,9 @@ def structure_score(documents: list[Document]) -> StructureScore:
     total = len(originals) or 1
     placed = [doc for doc in originals if doc.folder and doc.folder != "미분류"]
     tops = Counter(doc.folder for doc in placed)
-    leaves = Counter((doc.folder, doc.subfolder) for doc in placed)
-    subs = Counter(folder for folder, sub in leaves if sub)  # 최상위 폴더마다 하위 폴더 수
+    leaves = Counter(route(doc) for doc in placed)
+    # 폴더마다 바로 아래 하위 폴더 수(대분류 아래 중분류, 중분류 아래 소분류)
+    subs = Counter(path[:-1] for path in {path[:depth] for path in leaves for depth in range(2, len(path) + 1)})
     format_share = sum(doc.folder in FORMAT_FOLDERS for doc in placed) / (len(placed) or 1)
     # 최종 위치(하위 폴더가 있으면 하위 폴더) 기준으로 파일 1~2개짜리 폴더 비율
     small_share = sum(size <= 2 for size in leaves.values()) / (len(leaves) or 1)
@@ -60,7 +61,7 @@ def structure_score(documents: list[Document]) -> StructureScore:
     words = {name: _tokens(name) for name in topic_tops}
     overlapping = sum(any(words[name] & words[other] for other in topic_tops if other != name)
                       for name in topic_tops) / (len(topic_tops) or 1)
-    names = list(tops) + [sub for _, sub in leaves if sub]
+    names = list(tops) + sorted({name for path in leaves for name in path[1:]})
     short = sum(len(name) <= 15 for name in names) / (len(names) or 1)
     biggest_sub = max(subs.values(), default=0)
     topic_names = [name for name in names if name not in FORMAT_FOLDERS]
@@ -69,7 +70,7 @@ def structure_score(documents: list[Document]) -> StructureScore:
 
     def represents(doc: Document) -> bool:
         text = f"{doc.source.stem} {doc.lead_text}".casefold().replace(" ", "")
-        terms = [term for name in (doc.folder, doc.subfolder) if name
+        terms = [term for name in route(doc) if name
                  for term in _tokens(name) if term not in VAGUE_WORDS]
         return any(term in text for term in terms)
 

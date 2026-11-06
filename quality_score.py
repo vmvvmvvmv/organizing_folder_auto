@@ -36,7 +36,7 @@ class QualityCheck:
 
 def _has_evidence(doc: Document) -> bool:
     text = re.sub(r"[^가-힣A-Za-z]", "", f"{doc.source.stem} {doc.lead_text}").casefold()
-    names = [doc.folder, doc.subfolder] if doc.subfolder else [doc.folder]
+    names = [name for name in (doc.folder, doc.subfolder, doc.detail) if name]
     return any(term in text for name in names for term in _tokens(name))
 
 

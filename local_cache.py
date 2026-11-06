@@ -121,14 +121,16 @@ def cached_hierarchy(store: MutableMapping) -> dict[str, Callable]:
 
     def cached(kind: str, call: Callable, *args: object) -> object:
         key = "hierarchy-" + kind + json.dumps(
-            [ai_hierarchy.TAXONOMY_INSTRUCTIONS, ai_hierarchy.PICK_INSTRUCTIONS, args],
+            [ai_hierarchy.TAXONOMY_INSTRUCTIONS, ai_hierarchy.MIDDLE_INSTRUCTIONS,
+             ai_hierarchy.PICK_INSTRUCTIONS, args],
             ensure_ascii=False, sort_keys=True)
         if key not in store:
             store[key] = {"ok": call(*args)}
         return store[key]["ok"]
 
     return {
-        "taxonomy": lambda folders, low, high: cached("taxonomy", ai_hierarchy.ollama_taxonomy, folders, low, high),
+        "taxonomy": lambda folders, low, high, parent="": cached(
+            "taxonomy", ai_hierarchy.ollama_taxonomy, folders, low, high, parent),
         "pick": lambda folders, categories: cached("pick", ai_hierarchy.ollama_pick, folders, categories),
         "embed": lambda texts: cached("embed", ai_groups.ollama_embeddings, texts),
     }
