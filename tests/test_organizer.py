@@ -67,6 +67,21 @@ class OrganizerTests(unittest.TestCase):
                 for call in run.call_args_list
             ))
 
+    def test_plain_text_files_are_read_in_common_korean_encodings(self):
+        samples = {
+            "memo.txt": "출장 결과 메모".encode("utf-8"),
+            "notes.md": "# 회의록\n안건".encode("cp949"),
+            "table.csv": "지역,인구\n장유,1000".encode("utf-16"),
+        }
+        for name, data in samples.items():
+            (self.folder / name).write_bytes(data)
+        self.assertEqual(read_document(self.folder / "memo.txt", None), ("출장 결과 메모", "텍스트 파일"))
+        self.assertIn("회의록", read_document(self.folder / "notes.md", None)[0])
+        self.assertIn("장유", read_document(self.folder / "table.csv", None)[0])
+        (self.folder / "binary.txt").write_bytes(b"MZ\x00\x01\x02")
+        with self.assertRaises(ValueError):
+            read_document(self.folder / "binary.txt", None)
+
     def test_xlsx_and_pptx_text(self):
         xlsx = self.folder / "sample.xlsx"
         pptx = self.folder / "sample.pptx"
@@ -268,12 +283,25 @@ class OrganizerTests(unittest.TestCase):
         source.write_bytes(b"same document")
         destination = self.folder / "result"
         destination.mkdir()
-        existing = destination / "already.pdf"
+        (destination / "자료").mkdir()
+        existing = destination / "자료" / "already.pdf"
         existing.write_bytes(source.read_bytes())
         moved, deduplicated, errors = move_documents([Document(source, "자료", "", "")], destination)
         self.assertEqual((len(moved), len(deduplicated), len(errors)), (0, 1, 0))
         self.assertEqual(deduplicated[0][1], existing)
         self.assertFalse(source.exists())
+
+    def test_existing_identical_file_in_other_folder_does_not_remove_source(self):
+        source = self.folder / "source.pdf"
+        source.write_bytes(b"same document")
+        destination = self.folder / "result"
+        (destination / "사진").mkdir(parents=True)
+        (destination / "사진" / "old.pdf").write_bytes(source.read_bytes())
+        moved, deduplicated, errors = move_documents([Document(source, "자료", "", "")], destination)
+        # 미리보기에서 고른 '자료' 폴더에 실제로 파일이 생겨야 한다.
+        self.assertEqual((len(moved), len(deduplicated), len(errors)), (1, 0, 0))
+        self.assertEqual(moved[0][1], destination / "자료" / "source.pdf")
+        self.assertTrue((destination / "사진" / "old.pdf").exists())
 
     def test_failure_to_remove_original_keeps_both_verified_files(self):
         source = self.folder / "source.pdf"
@@ -290,7 +318,30 @@ class OrganizerTests(unittest.TestCase):
         with mock.patch("organizer.Path.unlink", new=unlink):
             moved, deduplicated, errors = move_documents([Document(source, "자료", "", "")], destination)
         self.assertEqual((len(moved), len(deduplicated), len(errors)), (0, 0, 1))
-        self.assertEqual(source.read_bytes(), (destination / "자료" / source.name).read_bytes())
+        # 원본을 못 지우면 사본을 지워 기록(이동 실패)과 실제 상태를 맞춘다.
+        self.assertEqual(source.read_bytes(), b"original document")
+        self.assertFalse((destination / "자료" / source.name).exists())
+        self.assertIn("원본을 유지", errors[0][1])
+
+    def test_read_only_original_is_moved(self):
+        source = self.folder / "source"
+        destination = self.folder / "result"
+        source.mkdir()
+        destination.mkdir()
+        path = source / "읽기전용.xyz"
+        path.write_bytes(b"read only")
+        os.chmod(path, 0o444)
+        self.addCleanup(lambda: [os.chmod(p, 0o666) for p in self.folder.rglob("*") if p.is_file()])
+        documents = scan(source, destination, None)
+        documents[0].folder = "자료"
+        with organizer.ResultReport(source, destination, documents) as report:
+            moved, _, errors = move_documents(documents, destination, source_root=source, record=report.record)
+        self.assertEqual((len(moved), errors), (1, []))
+        self.assertFalse(path.exists())
+        # 결과 사본은 읽기 전용 속성을 그대로 갖고, 되돌리기도 막히지 않는다.
+        restored, undo_errors = organizer.undo_report(report.path)
+        self.assertEqual((len(restored), undo_errors), (1, []))
+        self.assertEqual(path.read_bytes(), b"read only")
 
     def test_move_report_records_every_result_and_keeps_previous_reports(self):
         source = self.folder / "source"
@@ -305,12 +356,12 @@ class OrganizerTests(unittest.TestCase):
             Document(files[1], "자료", "공통 단어", "중복 파일"),
             Document(files[2], "../outside", "사용자 지정", ""),
         ]
-        moved, deduplicated, errors = move_documents(documents, destination)
-        self.assertTrue(hasattr(organizer, "write_result_report"))
-        first_report = organizer.write_result_report(source, destination, documents, moved, deduplicated, errors)
-        second_report = organizer.write_result_report(source, destination, documents, moved, deduplicated, errors)
-        self.assertNotEqual(first_report, second_report)
-        with first_report.open(encoding="utf-8-sig", newline="") as stream:
+        with organizer.ResultReport(source, destination, documents) as first_report:
+            moved, deduplicated, errors = move_documents(documents, destination, record=first_report.record)
+        with organizer.ResultReport(source, destination, documents) as second_report:
+            pass
+        self.assertNotEqual(first_report.path, second_report.path)
+        with first_report.path.open(encoding="utf-8-sig", newline="") as stream:
             rows = list(csv.DictReader(stream))
         self.assertEqual([row["상태"] for row in rows], ["이동", "중복 정리", "이동 실패"])
         self.assertEqual(rows[1]["결과 파일"], str(moved[0][1]))
@@ -327,18 +378,196 @@ class OrganizerTests(unittest.TestCase):
             path.write_bytes(f"content {index}".encode())
             documents.append(Document(path, "자료", "", ""))
         stop = threading.Event()
-        moved, deduplicated, errors = move_documents(
-            documents, destination,
-            lambda done, total: stop.set() if done == 1 else None,
-            should_cancel=stop.is_set,
-        )
+        with organizer.ResultReport(source, destination, documents) as report:
+            moved, deduplicated, errors = move_documents(
+                documents, destination,
+                lambda done, total: stop.set() if done == 1 else None,
+                should_cancel=stop.is_set, record=report.record,
+            )
         self.assertEqual((len(moved), len(deduplicated), len(errors)), (1, 0, 0))
         self.assertFalse(documents[0].source.exists())
         self.assertTrue(all(doc.source.exists() for doc in documents[1:]))
-        report = organizer.write_result_report(source, destination, documents, moved, deduplicated, errors)
-        with report.open(encoding="utf-8-sig", newline="") as stream:
+        with report.path.open(encoding="utf-8-sig", newline="") as stream:
             rows = list(csv.DictReader(stream))
         self.assertEqual([row["상태"] for row in rows], ["이동", "미처리", "미처리"])
+
+    def organize(self, files):
+        source = self.folder / "source"
+        destination = self.folder / "result"
+        destination.mkdir()
+        for name, data in files.items():
+            path = source / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        documents = scan(source, destination, None)
+        for doc in documents:
+            if not doc.preserve_structure:
+                doc.folder = "자료"
+        with organizer.ResultReport(source, destination, documents) as report:
+            move_documents(documents, destination, source_root=source, record=report.record)
+        return source, destination, report.path
+
+    def test_undo_restores_moved_duplicate_and_gis_files_to_original_places(self):
+        files = {"a/보고서.xyz": b"report", "b/사본.xyz": b"report", "c/메모.xyz": b"memo",
+                 "maps/area.shp": b"shape", "maps/area.shx": b"index"}
+        source, destination, report = self.organize(files)
+        self.assertFalse(any(path.is_file() for path in source.rglob("*")))
+        restored, errors = organizer.undo_report(report)
+        self.assertEqual((len(restored), errors), (5, []))
+        for name, data in files.items():
+            self.assertEqual((source / name).read_bytes(), data)
+        # 결과 폴더에는 기록 파일만 남고 비워진 하위 폴더는 지워진다.
+        self.assertEqual([path.name for path in destination.iterdir()], [report.name])
+
+    def test_undo_skips_file_whose_original_place_is_taken_again(self):
+        source, destination, report = self.organize({"메모.xyz": b"memo", "표.xyz": b"table"})
+        (source / "메모.xyz").write_bytes(b"new file created later")
+        restored, errors = organizer.undo_report(report)
+        self.assertEqual([original.name for _, original in restored], ["표.xyz"])
+        self.assertIn("이미 있어", errors[0][1])
+        self.assertEqual((source / "메모.xyz").read_bytes(), b"new file created later")
+        self.assertTrue((destination / "자료" / "메모.xyz").exists())
+
+    def test_undo_refuses_paths_outside_the_report_folder(self):
+        source, destination, report = self.organize({"메모.xyz": b"memo"})
+        outside = self.folder / "outside.xyz"
+        outside.write_bytes(b"not part of the result")
+        text = report.read_text(encoding="utf-8-sig")
+        report.write_text(text.replace(str(destination / "자료" / "메모.xyz"), str(outside)),
+                          encoding="utf-8-sig")
+        restored, errors = organizer.undo_report(report)
+        self.assertEqual(restored, [])
+        self.assertIn("결과 폴더와 맞지 않습니다", errors[0][1])
+        self.assertTrue(outside.exists())
+
+    def test_undo_explains_old_reports_without_original_paths(self):
+        report = self.folder / "정리_결과_old.csv"
+        report.write_text("원본,폴더,상태,결과 파일\na.pdf,자료,이동,x\n", encoding="utf-8-sig")
+        with self.assertRaisesRegex(ValueError, "원래 위치 정보"):
+            organizer.undo_report(report)
+
+    def test_report_keeps_finished_rows_when_move_crashes(self):
+        source = self.folder / "source"
+        destination = self.folder / "result"
+        source.mkdir()
+        destination.mkdir()
+        documents = []
+        for index in range(2):
+            path = source / f"file{index}.pdf"
+            path.write_bytes(f"content {index}".encode())
+            documents.append(Document(path, "자료", "", ""))
+
+        def crash(done, _total):
+            if done == 1:
+                raise RuntimeError("simulated crash")
+
+        report = organizer.ResultReport(source, destination, documents)
+        with self.assertRaises(RuntimeError):
+            move_documents(documents, destination, crash, record=report.record)
+        # 닫기 전(프로세스가 죽은 상황)에도 처리한 줄은 이미 디스크에 있다.
+        with report.path.open(encoding="utf-8-sig", newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        report.close()
+        self.assertEqual([row["상태"] for row in rows], ["이동"])
+
+    def test_gis_group_failure_mid_copy_keeps_whole_set_in_source(self):
+        source = self.folder / "source"
+        destination = self.folder / "result"
+        maps = source / "maps"
+        maps.mkdir(parents=True)
+        destination.mkdir()
+        for suffix in (".shp", ".shx", ".dbf"):
+            (maps / f"area{suffix}").write_bytes(suffix.encode() * 10)
+        documents = scan(source, destination, None)
+        real_copy = organizer.shutil.copyfileobj
+
+        def fail_on_dbf(original, output):
+            if original.name.endswith(".dbf"):
+                raise OSError("disk full")
+            return real_copy(original, output)
+
+        with mock.patch("organizer.shutil.copyfileobj", side_effect=fail_on_dbf):
+            moved, deduplicated, errors = move_documents(documents, destination, source_root=source)
+        self.assertEqual((len(moved), len(deduplicated), len(errors)), (0, 0, 3))
+        self.assertTrue(all(doc.source.exists() for doc in documents))
+        self.assertFalse([path for path in destination.rglob("*") if path.is_file()])
+        self.assertIn("area.dbf", errors[0][1])
+
+    def test_unreadable_file_fails_alone_instead_of_blocking_run(self):
+        source = self.folder / "source"
+        destination = self.folder / "result"
+        source.mkdir()
+        destination.mkdir()
+        (source / "locked.pdf").write_bytes(b"locked")
+        (source / "free.pdf").write_bytes(b"free")
+        documents = scan(source, destination, None)
+        real_digest = organizer._digest
+
+        def digest(path):
+            if path.name == "locked.pdf":
+                raise PermissionError(13, "Permission denied")
+            return real_digest(path)
+
+        with mock.patch("organizer._digest", side_effect=digest):
+            moved, deduplicated, errors = move_documents(documents, destination, source_root=source)
+        self.assertEqual([doc.source.name for doc, _ in moved], ["free.pdf"])
+        self.assertEqual([doc.source.name for doc, _ in errors], ["locked.pdf"])
+        self.assertTrue((source / "locked.pdf").exists())
+
+    def test_locked_file_during_preview_is_reported_and_never_moved(self):
+        source = self.folder / "source"
+        destination = self.folder / "result"
+        source.mkdir()
+        destination.mkdir()
+        (source / "locked.xyz").write_bytes(b"locked")
+        (source / "free.xyz").write_bytes(b"free")
+        real_digest = organizer._digest
+        locked = True
+
+        def digest(path):
+            if locked and path.name == "locked.xyz":
+                raise PermissionError(13, "Permission denied")
+            return real_digest(path)
+
+        with mock.patch("organizer._digest", side_effect=digest):
+            documents = scan(source, destination, None)
+        by_name = {doc.source.name: doc for doc in documents}
+        self.assertIn("읽을 수 없습니다", by_name["locked.xyz"].error)
+        self.assertEqual(by_name["free.xyz"].error, "")
+        locked = False  # 미리보기 뒤 잠금이 풀려도 확인하지 못한 파일은 옮기지 않는다
+        moved, deduplicated, errors = move_documents(documents, destination, source_root=source)
+        self.assertEqual([doc.source.name for doc, _ in moved], ["free.xyz"])
+        self.assertEqual([doc.source.name for doc, _ in errors], ["locked.xyz"])
+        self.assertTrue((source / "locked.xyz").exists())
+
+    def test_code_projects_and_tool_folders_are_left_untouched(self):
+        source = self.folder / "source"
+        destination = self.folder / "result"
+        destination.mkdir()
+        for name in ("메모.xyz", "web/package.json", "web/src/app.js", "tool/.git/HEAD",
+                     "tool/main.py", "docs/node_modules/lib/index.js", "docs/보고.xyz"):
+            path = source / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(name.encode())
+        files, projects = organizer.source_files(source, destination)
+        self.assertEqual([path.relative_to(source).as_posix() for path in files],
+                         ["docs/보고.xyz", "메모.xyz"])
+        self.assertEqual(sorted(path.name for path in projects), ["tool", "web"])
+        documents = scan(source, destination, None)
+        self.assertEqual(len(documents), 2)
+        # 프로젝트 안 파일이 바뀌어도 미리보기와 비교할 목록에 들어가지 않는다.
+        (source / "web" / "src" / "new.js").write_bytes(b"new")
+        moved, _, errors = move_documents(documents, destination, source_root=source)
+        self.assertEqual((len(moved), len(errors)), (2, 0))
+        self.assertTrue((source / "web" / "src" / "app.js").exists())
+        self.assertTrue((source / "docs" / "node_modules" / "lib" / "index.js").exists())
+
+    def test_choosing_a_code_project_itself_is_refused(self):
+        source = self.folder / "project"
+        source.mkdir()
+        (source / "package.json").write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "코드 프로젝트"):
+            scan(source, self.folder / "result", None)
 
     def test_scan_can_stop_between_files(self):
         source = self.folder / "source"
@@ -350,6 +579,92 @@ class OrganizerTests(unittest.TestCase):
             scan(source, self.folder / "result", None,
                  lambda done, total: stop.set() if done == 1 else None,
                  should_cancel=stop.is_set)
+
+    def test_scan_ai_only_skips_keyword_folder_proposals(self):
+        source = self.folder / "ai_source"
+        source.mkdir()
+        (source / "출장 보고서.txt").write_text("출장", encoding="utf-8")
+        with mock.patch("organizer.propose_folders", side_effect=AssertionError("keyword rules used")):
+            documents = scan(source, self.folder / "ai_result", None, classify=False)
+        self.assertEqual([doc.folder for doc in documents], ["미분류"])
+
+    def test_output_filename_changes_only_after_verified_move(self):
+        source = self.folder / "memo.txt"
+        source.write_text("original", encoding="utf-8")
+        destination = self.folder / "renamed_result"
+        destination.mkdir()
+        doc = Document(source, "자료", "", "파일명·형식")
+        rename = getattr(organizer, "rename_document", lambda *args: None)
+        rename(doc, "새 메모.txt")
+        self.assertTrue(source.is_file())
+        self.assertEqual(doc.output_name, "새 메모.txt")
+        moved, duplicates, errors = move_documents([doc], destination)
+        self.assertEqual((len(moved), len(duplicates), len(errors)), (1, 0, 0))
+        self.assertEqual(moved[0][1].name, "새 메모.txt")
+        self.assertEqual(moved[0][1].read_text(encoding="utf-8"), "original")
+
+    def test_output_filename_preserves_extension_and_rejects_structured_files(self):
+        rename = getattr(organizer, "rename_document", lambda *args: None)
+        doc = Document(Path("memo.pdf"), "자료", "", "PDF 텍스트")
+        with self.assertRaises(ValueError):
+            rename(doc, "memo.exe")
+        with self.assertRaises(ValueError):
+            rename(doc, "../memo.pdf")
+        structured = Document(Path("map.shp"), "GIS 자료", "", "파일명·형식", preserve_structure=True)
+        with self.assertRaises(ValueError):
+            rename(structured, "other.shp")
+
+    def test_reassign_preview_moves_duplicate_with_original(self):
+        original = Document(Path("root/a.pdf"), "기존", "", "PDF 텍스트")
+        duplicate = Document(Path("root/copy.pdf"), "기존", "", "중복 파일",
+                             duplicate_of=original.source)
+        other = Document(Path("root/other.pdf"), "다른 폴더", "", "PDF 텍스트")
+        documents = [original, duplicate, other]
+        assign = getattr(organizer, "reassign_documents", lambda *args: [])
+        changed = assign(documents, [1], "새 폴더", "세부")
+        self.assertEqual(changed, [0, 1])
+        self.assertEqual([(doc.folder, doc.subfolder) for doc in documents],
+                         [("새 폴더", "세부"), ("새 폴더", "세부"), ("다른 폴더", "")])
+        self.assertEqual(original.folder_reason, "사용자 지정")
+
+    def test_reassign_preview_keeps_gis_components_together(self):
+        source = self.folder / "source"
+        destination = self.folder / "result"
+        maps = source / "maps"
+        maps.mkdir(parents=True)
+        destination.mkdir()
+        (maps / "area.shp").write_bytes(b"shape")
+        (maps / "area.shx").write_bytes(b"index")
+        (maps / "area.qmd").write_text("<qgis version='3.40'></qgis>", encoding="utf-8")
+        documents = scan(source, destination, None)
+        shp_index = next(index for index, doc in enumerate(documents) if doc.source.suffix == ".shp")
+        assign = getattr(organizer, "reassign_documents", lambda *args: [])
+        changed = assign(documents, [shp_index], "새 GIS 폴더", "")
+        self.assertEqual(len(changed), 3)
+        self.assertEqual({doc.folder for doc in documents}, {"새 GIS 폴더"})
+        moved, duplicates, errors = move_documents(documents, destination, source_root=source)
+        self.assertEqual((len(moved), len(duplicates), len(errors)), (3, 0, 0))
+
+    def test_reassign_preview_rejects_invalid_folder_without_changes(self):
+        doc = Document(Path("root/a.pdf"), "기존", "원래 분류", "PDF 텍스트")
+        assign = getattr(organizer, "reassign_documents", lambda *args: [])
+        with self.assertRaises(ValueError):
+            assign([doc], [0], "../밖", "")
+        self.assertEqual((doc.folder, doc.folder_reason), ("기존", "원래 분류"))
+
+    def test_qgis_metadata_moves_with_its_map_layer(self):
+        source = self.folder / "source"
+        destination = self.folder / "result"
+        source_group = source / "maps"
+        source_group.mkdir(parents=True)
+        destination.mkdir()
+        (source_group / "area.shp").write_bytes(b"shape")
+        (source_group / "area.qmd").write_text("<qgis version='3.40'></qgis>", encoding="utf-8")
+        documents = scan(source, destination, None)
+        self.assertEqual({doc.folder for doc in documents}, {"GIS 자료"})
+        moved, duplicates, errors = move_documents(documents, destination, source_root=source)
+        self.assertEqual((len(moved), len(duplicates), len(errors)), (2, 0, 0))
+        self.assertEqual({target.parent for _, target in moved}, {destination / "GIS 자료" / "maps"})
 
     def test_other_file_types_are_previewed_and_moved_with_related_files(self):
         source = self.folder / "source"
@@ -383,6 +698,21 @@ class OrganizerTests(unittest.TestCase):
             if doc.source.suffix in {".shp", ".shx", ".prj", ".exe", ".dll"}:
                 self.assertEqual(target.parent.relative_to(destination).parts[1:], doc.source.parent.relative_to(source).parts)
         self.assertFalse(any(doc.source.exists() for doc in documents))
+
+    def test_gis_sidecars_keep_their_route_after_shape_file_moves_first(self):
+        source = self.folder / "source"
+        destination = self.folder / "result"
+        maps = source / "maps"
+        maps.mkdir(parents=True)
+        destination.mkdir()
+        (maps / "area.shp").write_bytes(b"shape")
+        (maps / "area.fix").write_bytes(b"index")
+        (maps / "area.cst").write_bytes(b"EUC-KR")
+        documents = scan(source, destination, None)
+        documents.sort(key=lambda doc: doc.source.suffix != ".shp")
+        moved, duplicates, errors = move_documents(documents, destination, source_root=source)
+        self.assertEqual((len(moved), len(duplicates), len(errors)), (3, 0, 0))
+        self.assertEqual({target.parent for _, target in moved}, {destination / "GIS 자료" / "maps"})
 
     def test_related_gis_files_stay_in_source_if_one_target_conflicts(self):
         source = self.folder / "source"
