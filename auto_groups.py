@@ -18,6 +18,21 @@ def _tokens(text: str) -> set[str]:
     }
 
 
+# 폴더 이름에 이 단어들만 있으면 안에 어떤 파일이 있는지 알 수 없다('업무 운영', '기술', '실습 자료').
+# '사진'·'이미지'는 파일 종류를 알려 주므로 모호하지 않다(가족 사진 폴더를 '사진'으로 둔 경우 등).
+VAGUE_WORDS = {"관리", "운영", "업무", "자료", "기술", "실습", "지원", "기타", "일반", "문서", "정보",
+               "기록", "내용", "파일", "관련", "사항", "활동", "서비스", "전략", "기획", "분석", "모음",
+               "데이터", "프로젝트", "참고", "보관", "작업", "개발", "제작", "콘텐츠"}
+
+
+def is_vague_name(name: str) -> bool:
+    # 주제 폴더 안의 연도 하위 폴더('2024')는 기록관리 지침에서도 쓰는 정리 방식이라 모호하지 않다.
+    if re.fullmatch(r"(19|20)\d{2}(년)?", name.strip()):
+        return False
+    words = [word.casefold() for word in WORDS.findall(name)]
+    return not words or all(word in VAGUE_WORDS or word in COMMON for word in words)
+
+
 def _name_tokens(text: str) -> set[str]:
     terms = _tokens(text)
     # 띄어쓰지 않은 파일명도 앞부분이 같으면 묶을 수 있게 한다.

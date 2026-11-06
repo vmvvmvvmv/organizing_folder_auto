@@ -12,7 +12,7 @@ import re
 from pathlib import Path
 from collections.abc import Callable
 
-from auto_groups import WORDS, _tokens, propose_folders
+from auto_groups import WORDS, _tokens, is_vague_name, propose_folders
 from classification_rules import TYPE_FOLDERS, is_structured_file, is_type_only, type_folder
 from organizer import Document, valid_folder_name
 
@@ -766,6 +766,11 @@ def assign_ai_folders(
                         or meaning_evidence(candidate, eligible[member])
                     ):
                         candidate = "미분류"
+                    # '업무 실습 자료'처럼 넓은 말뿐인 이름은 안에 무엇이 있는지 알 수 없어 받지 않는다.
+                    if (candidate != "미분류" and is_vague_name(candidate)
+                            and candidate not in TYPE_FOLDERS.values()
+                            and candidate not in {"GIS 자료", "버전 관리 설정", IMAGE_FOLDER}):
+                        candidate = "미분류"
                     if candidate != "미분류":
                         key = candidate.replace(" ", "").casefold()
                         if key not in names:
@@ -865,7 +870,7 @@ def assign_ai_folders(
                         or folder == type_folder(doc.source)):
                     continue
                 key = folder.replace(" ", "").casefold()
-                if key in type_names:
+                if key in type_names or is_vague_name(folder):
                     continue
                 # 재판정은 기존 폴더를 고르거나, 새 이름이면 모델이 본 본문에 근거가 있어야 한다.
                 if key not in names:

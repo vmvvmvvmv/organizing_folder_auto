@@ -12,11 +12,14 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import contextlib
+import copy
 import webbrowser
 
 from quality_score import quality_check
+from structure_score import structure_score
+from ai_hierarchy import FORMAT_FOLDERS as HIERARCHY_FORMAT_FOLDERS, MIN_TOPICS, add_top_level
 from ollama_setup import find_ollama, install_ollama, start_ollama, wait_until_running, winget_available
-from local_cache import LocalCache, cached_ollama, clear_cache, default_cache_path
+from local_cache import LocalCache, cached_hierarchy, cached_ollama, clear_cache, default_cache_path
 from ai_groups import OLLAMA_DOWNLOAD, assign_ai_folders, ollama_missing_models, ollama_pull
 from organizer import Document, default_destination, move_documents, reassign_documents, rename_document, rename_folder, rename_subfolder, scan, source_files, undo_jobs, undo_report, valid_folder_name, ResultReport
 from reader import IMAGE_TYPES, MAX_FILE_BYTES, SUPPORTED, find_tesseract, ocr_status
@@ -174,6 +177,8 @@ class OrganizerApp(tk.Tk):
         self.rename_item: str | None = None
         self.context_item: str | None = None
         self.ai_var = tk.BooleanVar(value=False)
+        # 대분류로 묶기 전의 (폴더, 하위 폴더, 분류 이유). 묶기를 풀 때 되돌린다.
+        self.grouped_snapshot: list[tuple[str, str, str]] | None = None
         self.cache_var = tk.BooleanVar(value=True)
 
         frame = ttk.Frame(self, padding=14)
@@ -227,6 +232,9 @@ class OrganizerApp(tk.Tk):
         ttk.Label(filters, textvariable=self.count_var).pack(side="left")
         ttk.Button(filters, text="모두 접기", command=lambda: self.set_all_folders_open(False)).pack(side="right")
         ttk.Button(filters, text="보기", command=self.show_selected_preview).pack(side="right", padx=6)
+        self.group_button = ttk.Button(filters, text="대분류로 묶기", command=self.toggle_top_level,
+                                       state="disabled")
+        self.group_button.pack(side="right", padx=6)
         ttk.Button(filters, text="모두 펼치기", command=lambda: self.set_all_folders_open(True)).pack(
             side="right", padx=6
         )
@@ -406,6 +414,7 @@ class OrganizerApp(tk.Tk):
         self.scan_button.configure(state="disabled" if busy else "normal")
         self.ai_checkbox.configure(state="disabled" if busy else "normal")
         self.undo_button.configure(state="disabled" if busy else "normal")
+        self.group_button.configure(state="disabled" if busy or not self.documents else "normal")
         self.move_button.configure(state="disabled" if busy or not self.documents or self.preview_paths is None else "normal")
         self.cancel_button.configure(state="normal" if busy and not self.cancel_event.is_set() else "disabled")
 
@@ -551,6 +560,68 @@ class OrganizerApp(tk.Tk):
             messagebox.showerror("저장 내용 지우기", str(exc))
             return
         self.status_var.set("저장한 내용을 지웠습니다")
+
+    def preview_summary(self, counts: bool = True) -> str:
+        """미리보기 요약: 개수, 확인 권장 신호, 구조 점수."""
+        lines = []
+        if counts:
+            unknown = sum(doc.folder == "미분류" for doc in self.documents)
+            failed = sum(bool(document.error) for document in self.documents)
+            duplicates = sum(document.duplicate_of is not None for document in self.documents)
+            filename_only = sum(document.source.suffix.lower() not in SUPPORTED for document in self.documents)
+            folder_count = len({doc.folder for doc in self.documents if doc.folder and doc.folder != "미분류"})
+            lines.append(
+                f"{len(self.documents)}개 확인 · 제안 폴더 {folder_count}개 · "
+                f"미분류 {unknown}개 · 읽기 실패 {failed}개 · "
+                f"동일 파일 {duplicates}개 · 파일명 기준 {filename_only}개."
+                + (f" {self.scan_note}" if getattr(self, "scan_note", "") else ""))
+        lines.append(quality_check(self.documents).summary())
+        lines.append(structure_score(self.documents).summary() + " (기록관리 지침 기준, 찾기 쉬운 구조인지)")
+        return "\n".join(lines)
+
+    def toggle_top_level(self) -> None:
+        """세부 주제 폴더를 AI가 만든 대분류 아래로 묶거나, 묶기 전으로 되돌린다."""
+        if self.busy or not self.documents:
+            return
+        if self.grouped_snapshot is not None:
+            if not messagebox.askyesno(
+                "대분류 풀기", "대분류를 풀면 묶은 뒤 바꾼 분류도 묶기 전 상태로 돌아갑니다. 풀까요?",
+            ):
+                return
+            for doc, (folder, subfolder, reason) in zip(self.documents, self.grouped_snapshot):
+                doc.folder, doc.subfolder, doc.folder_reason = folder, subfolder, reason
+            self.grouped_snapshot = None
+            self.group_button.configure(text="대분류로 묶기")
+            self.refresh_table()
+            self.status_var.set("대분류를 풀었습니다.\n" + self.preview_summary(counts=False))
+            return
+        topics = {doc.folder for doc in self.documents if doc.duplicate_of is None
+                  and doc.folder not in {"", "미분류"} and doc.folder not in HIERARCHY_FORMAT_FOLDERS}
+        if len(topics) < MIN_TOPICS:
+            messagebox.showinfo(
+                "대분류로 묶기",
+                f"주제 폴더가 {len(topics)}개라 이미 한눈에 보입니다. {MIN_TOPICS}개 이상일 때 묶습니다.")
+            return
+        snapshot = [(doc.folder, doc.subfolder, doc.folder_reason) for doc in self.documents]
+        documents = copy.deepcopy(self.documents)  # 작업 스레드는 사본만 고친다.
+        use_cache = self.cache_var.get()
+        self.cancel_event.clear()
+        self._set_busy(True)
+        self.status_var.set("AI로 대분류를 만드는 중입니다…")
+
+        def work() -> None:
+            try:
+                if ollama_missing_models():
+                    raise RuntimeError("AI 모델이 없습니다. '로컬 AI 분류'를 켜서 먼저 준비하세요")
+                with contextlib.ExitStack() as stack:
+                    cache = stack.enter_context(LocalCache(default_cache_path())) if use_cache else None
+                    calls = cached_hierarchy(cache.responses()) if cache else {}
+                    plan = add_top_level(documents, **calls)
+                self.events.put(("grouped", documents, snapshot, plan, ""))
+            except (OSError, RuntimeError, ValueError) as exc:
+                self.events.put(("grouped", None, snapshot, {}, f"대분류를 만들지 못했습니다: {exc}"))
+
+        threading.Thread(target=work, daemon=False).start()
 
     def start_scan(self) -> None:
         if self.busy:
@@ -1154,20 +1225,32 @@ class OrganizerApp(tk.Tk):
                 elif kind == "scanned":
                     self.documents = event[1]
                     self.preview_paths = event[2]
+                    self.grouped_snapshot = None
+                    self.group_button.configure(text="대분류로 묶기")
                     self.refresh_table()
-                    unknown = sum(doc.folder == "미분류" for doc in self.documents)
-                    failed = sum(bool(document.error) for document in self.documents)
-                    duplicates = sum(document.duplicate_of is not None for document in self.documents)
-                    filename_only = sum(document.source.suffix.lower() not in SUPPORTED for document in self.documents)
-                    folder_count = len({doc.folder for doc in self.documents if doc.folder and doc.folder != "미분류"})
-                    self.status_var.set(
-                        f"{len(self.documents)}개 확인 · 제안 폴더 {folder_count}개 · "
-                        f"미분류 {unknown}개 · 읽기 실패 {failed}개 · "
-                        f"동일 파일 {duplicates}개 · 파일명 기준 {filename_only}개."
-                        + (f" {event[3]}" if event[3] else "")
-                        + f"\n{quality_check(self.documents).summary()}"
-                    )
+                    self.scan_note = event[3]
+                    self.status_var.set(self.preview_summary())
                     self._set_busy(False)
+                elif kind == "grouped":
+                    grouped, snapshot, plan, error = event[1:]
+                    self._set_busy(False)
+                    if error:
+                        self.status_var.set(error)
+                        if not self.close_requested:
+                            messagebox.showerror("대분류로 묶기", error)
+                    elif not plan:
+                        self.status_var.set("묶을 만한 대분류를 찾지 못해 그대로 두었습니다")
+                        if not self.close_requested:
+                            messagebox.showinfo("대분류로 묶기", "묶을 만한 대분류를 찾지 못해 그대로 두었습니다.")
+                    else:
+                        self.documents = grouped
+                        self.grouped_snapshot = snapshot
+                        self.group_button.configure(text="대분류 풀기")
+                        self.refresh_table()
+                        self.status_var.set(
+                            f"세부 주제 {len(plan)}개를 대분류 {len(set(plan.values()))}개로 묶었습니다. "
+                            "마음에 들지 않으면 끌어서 옮기거나 '대분류 풀기'를 누르세요.\n"
+                            + self.preview_summary(counts=False))
                 elif kind == "cancelled_scan":
                     self.preview_paths = None
                     self.status_var.set("검사가 중단되었습니다. 원본 파일은 그대로 있습니다.")

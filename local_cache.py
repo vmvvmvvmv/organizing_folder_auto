@@ -115,6 +115,25 @@ def clear_cache(path: Path) -> None:
         Path(f"{path}{suffix}").unlink(missing_ok=True)
 
 
+def cached_hierarchy(store: MutableMapping) -> dict[str, Callable]:
+    """대분류 묶기(ai_hierarchy.add_top_level)에 넘길 Ollama 함수 묶음. 지시문이 바뀌면 다시 묻는다."""
+    import ai_hierarchy
+
+    def cached(kind: str, call: Callable, *args: object) -> object:
+        key = "hierarchy-" + kind + json.dumps(
+            [ai_hierarchy.TAXONOMY_INSTRUCTIONS, ai_hierarchy.PICK_INSTRUCTIONS, args],
+            ensure_ascii=False, sort_keys=True)
+        if key not in store:
+            store[key] = {"ok": call(*args)}
+        return store[key]["ok"]
+
+    return {
+        "taxonomy": lambda folders, low, high: cached("taxonomy", ai_hierarchy.ollama_taxonomy, folders, low, high),
+        "pick": lambda folders, categories: cached("pick", ai_hierarchy.ollama_pick, folders, categories),
+        "embed": lambda texts: cached("embed", ai_groups.ollama_embeddings, texts),
+    }
+
+
 def cached_ollama(store: MutableMapping) -> dict[str, Callable]:
     """앱과 같은 Ollama 호출을 하되 같은 요청은 저장된 응답(오류 포함)을 다시 쓴다.
 
