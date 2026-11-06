@@ -570,7 +570,7 @@ class AiGroupTests(unittest.TestCase):
             note = ai_preview_note([doc], True, progress=progress, should_cancel=cancel)
         self.assertIn("AI 분류 1개", note)
         assign.assert_called_once_with([doc], progress=progress, should_cancel=cancel, ai_only=True,
-                                       source_root=None)
+                                       source_root=None, stage=None)
 
     def test_preview_does_not_swallow_cancellation(self):
         doc = Document(Path("출장.pdf"), "기존", "", "PDF 텍스트")

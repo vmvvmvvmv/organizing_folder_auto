@@ -230,18 +230,50 @@ class HierarchyTests(unittest.TestCase):
         self.assertEqual([d.folder for d in docs], ["기존"] * 16)
         self.assertEqual([d.subfolder for d in docs], [""] * 16)
 
-    def test_progress_reaches_completion_once_after_subfolders(self):
+    def test_each_stage_is_named_and_reports_its_own_progress(self):
         docs = [document(f"root/프로젝트 기능 기술서 {i}.pdf") for i in range(4)]
         docs += [document(f"root/프로젝트 발표자료 {i}.pdf") for i in range(4)]
-        updates = []
+        updates, stages = [], []
         assign_ai_folders(
             docs, embed=lambda texts: [[1.0, 0.0] for _ in texts],
             classify=lambda groups, folders: [("프로젝트", "같은 프로젝트")],
-            progress=lambda current, total: updates.append((current, total)),
+            progress=lambda current, total: updates.append((stages[-1], current, total)),
+            stage=stages.append,
         )
-        self.assertEqual(updates[-1], (24, 24))
-        self.assertTrue(all(total == 24 for _, total in updates))
-        self.assertEqual(sum(current == total for current, total in updates), 1)
+        # 단계마다 이름을 알려, 오래 걸리는 단계에서도 화면이 멈춘 것처럼 보이지 않게 한다.
+        self.assertEqual(stages, ["문서 내용 비교(임베딩)", "묶음 이름 짓기", "하위 폴더 나누기"])
+        self.assertIn(("문서 내용 비교(임베딩)", 8, 8), updates)
+        self.assertIn(("묶음 이름 짓기", 8, 8), updates)
+        self.assertTrue(all(0 <= current <= total for _, current, total in updates))
+
+    def test_retry_stage_reports_progress_and_sends_only_frequent_folders(self):
+        import ai_groups
+        docs = [document(f"root/주제{i:02d} 보고서.pdf", text=f"주제{i:02d} 관련 내용을 정리한 보고서입니다. " * 4)
+                for i in range(40)]
+        docs.append(document("root/알수없음.pdf", text="어느 주제에도 맞지 않는 긴 본문입니다. " * 6))
+        known_sizes, updates, stages = [], [], []
+
+        def classify(groups, folders):
+            if len(groups) == 1 and "알수없음" in groups[0]["documents"][0]["name"]:
+                known_sizes.append(len(folders))
+                return [("미분류", "단서 없음")]
+            return [(group["documents"][0]["name"][:4], "파일명") for group in groups]
+
+        counter = iter(range(1000))
+
+        def embed(texts):  # 문서마다 서로 다른 방향(묶이지 않게), 길이는 64로 고정
+            return [[float(k % 64 == j) for j in range(64)] for k in (next(counter) for _ in texts)]
+
+        assign_ai_folders(
+            docs, ai_only=True,
+            embed=embed,
+            classify=classify, subdivide=lambda items, parent: [("", "") for _ in items],
+            progress=lambda current, total: updates.append((stages[-1], current, total)), stage=stages.append,
+        )
+        self.assertIn("미분류 문서 다시 보기", stages)
+        self.assertTrue(any(name == "미분류 문서 다시 보기" for name, _, _ in updates))
+        # 마지막 요청이 재판정이다. 기존 폴더 40개 중 자주 쓰인 30개만 보낸다.
+        self.assertEqual(known_sizes[-1], ai_groups.RETRY_KNOWN_FOLDERS)
 
     def test_parent_topic_is_not_repeated_as_subfolder(self):
         docs = [document(f"root/지역인구 보고서 {i}.pdf") for i in range(4)]

@@ -201,6 +201,7 @@ def add_top_level(
     similarity: float = FIT_SIMILARITY,
     scores: dict[str, float] | None = None,
     middles: dict[str, str] | None = None,
+    stage: Callable[[str], None] | None = None,
 ) -> dict[str, str]:
     """세부 주제 폴더를 '대분류 / 중분류 / 세부 주제(소분류)'로 묶는다.
 
@@ -218,7 +219,9 @@ def add_top_level(
     # 문맥 길이를 넘지 않도록 예시는 짧은 파일명 하나만 쓴다.
     folders = [{"folder": name, "count": len(members[name]),
                 "examples": [_clean_text(members[name][0].source.stem)[:30]]} for name in topics]
+    stage = stage or (lambda _name: None)
     minimum, maximum = category_range(len(topics))
+    stage(f"대분류 만들기 (세부 주제 {len(topics)}개)")
     try:
         # 대분류 목록은 큰 주제들로 만든다. 나머지 주제도 아래 고르기에서 모두 배정된다.
         categories = _clean_categories(taxonomy(folders[:TAXONOMY_TOPICS], minimum, maximum),
@@ -227,6 +230,7 @@ def add_top_level(
         return {}
     if len(categories) < 2:
         return {}
+    stage(f"세부 주제를 대분류 {len(categories)}개에 나누는 중")
     plan = {topic: category for topic, category in _pick_all(folders, categories, pick).items()
             if category in categories and category != topic}
     vectors = _topic_vectors([row for row in folders if row["folder"] in plan], embed) if embed and plan else {}
@@ -239,6 +243,7 @@ def add_top_level(
         if len(rows) < MIN_MIDDLE_TOPICS:
             continue
         high = max(2, min(5, round(math.sqrt(len(rows))) + 1))
+        stage(f"중분류 만들기: {category}")
         try:
             names = _clean_categories([_strip_parent(name, category) for name in taxonomy(rows, 2, high, category)],
                                       {OTHER, "미분류", category})

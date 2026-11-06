@@ -23,6 +23,9 @@ LABEL_BATCH_SIZE = 4
 MAX_TEXT = 600
 SIMILARITY = 0.54
 SMALL_FOLDER = 2
+# 재판정 요청에 함께 보내는 기존 폴더 수 상한. 폴더가 수백 개면 요청이 문맥 길이(4096)를 넘을 수 있다.
+# (속도 효과는 작았다: 90개→30개에서 요청당 5.8초→5.5초.)
+RETRY_KNOWN_FOLDERS = 30
 # 819개 평가: 0.8 이상 병합 7건 중 6건이 같은 주제였다(예외: 제조업→음식업). 더 낮추면 업종끼리 섞인다.
 MERGE_SIMILARITY = 0.8
 # 세 폴더 평가: 0.75 이상은 거의 같은 주제였고, 그 아래부터 '기능'·'기반' 같은 흔한 단어로 잘못 합쳐졌다.
@@ -388,6 +391,7 @@ def _subfolder_suggestions(
     subdivide: Callable[[list[dict], str], list[tuple[str, str]]],
     should_cancel: Callable[[], bool] | None,
     root: Path | None = None,
+    progress: Callable[[int, int], None] | None = None,
 ) -> dict[Path, tuple[str, str]]:
     """연도가 명확하면 파일명으로, 아니면 구별되는 문서군만 세부 주제로 나눈다."""
     by_parent: dict[str, list[list[int]]] = {}
@@ -395,9 +399,11 @@ def _subfolder_suggestions(
         if parent != "미분류":
             by_parent.setdefault(parent, []).append(group)
     suggestions: dict[Path, tuple[str, str]] = {}
-    for parent, clusters in by_parent.items():
+    for done, (parent, clusters) in enumerate(by_parent.items()):
         if should_cancel and should_cancel():
             raise InterruptedError("AI 분류가 중단되었습니다")
+        if progress:
+            progress(done, len(by_parent))
         members = [index for cluster in clusters for index in cluster]
         years = {
             index: _year_from_name(documents[index].source.stem)
@@ -647,8 +653,13 @@ def assign_ai_folders(
     should_cancel: Callable[[], bool] | None = None,
     ai_only: bool = False,
     source_root: Path | None = None,
+    stage: Callable[[str], None] | None = None,
 ) -> int:
-    """선택한 폴더 안에서만 묶음을 만들고, 모두 성공하면 미리보기에 한꺼번에 반영한다."""
+    """선택한 폴더 안에서만 묶음을 만들고, 모두 성공하면 미리보기에 한꺼번에 반영한다.
+
+    stage를 주면 단계가 바뀔 때마다 단계 이름을 알리고, progress는 그 단계 안의 진행 수를 알린다.
+    """
+    stage = stage or (lambda _name: None)
     if batch_size < 1 or label_batch_size < 1:
         raise ValueError("AI 묶음 크기는 1 이상이어야 합니다")
     originals = [doc for doc in documents if doc.duplicate_of is None]
@@ -665,6 +676,7 @@ def assign_ai_folders(
     start = 0
     limit = batch_size
     text_limit = MAX_TEXT
+    stage("문서 내용 비교(임베딩)")
     while start < total:
         if should_cancel and should_cancel():
             raise InterruptedError("AI 분류가 중단되었습니다")
@@ -685,7 +697,7 @@ def assign_ai_folders(
         start += len(batch)
         text_limit = MAX_TEXT
         if progress:
-            progress(start, total * 3)
+            progress(start, total)
     vectors = [_unit(vector) for vector in vectors]
     vector_of = {doc.source: vector for doc, vector in zip(eligible, vectors)}
     name_vectors: dict[str, list[float] | None] = {}
@@ -713,6 +725,7 @@ def assign_ai_folders(
     limit = label_batch_size
     reduced_successes = 0
     sample_limit = 120
+    stage("묶음 이름 짓기")
     while start < len(groups):
         if should_cancel and should_cancel():
             raise InterruptedError("AI 분류가 중단되었습니다")
@@ -830,9 +843,7 @@ def assign_ai_folders(
                 limit = min(label_batch_size, limit * 2)
                 reduced_successes = 0
         if progress:
-            progress(total + completed, total * 3)
-    if progress and total:
-        progress(total * 2, total * 3)
+            progress(completed, total)
     if ai_only:
         # 묶음 이름이 문서 원문과 글자 단위로 맞지 않아 빠진 경우에만 재질문한다.
         # 텍스트가 짧거나 읽기 실패한 파일에는 추측을 늘리지 않는다.
@@ -842,13 +853,22 @@ def assign_ai_folders(
         type_names = {name.replace(" ", "").casefold()
                       for name in {*TYPE_FOLDERS.values(), "GIS 자료", "버전 관리 설정"}}
         # 서로 무관한 문서를 한 요청에 묶으면 모델이 id를 바꿔 답하는 일이 있어 한 건씩 묻는다.
-        for position in retry:
+        stage("미분류 문서 다시 보기")
+        for done, position in enumerate(retry):
             if should_cancel and should_cancel():
                 raise InterruptedError("AI 분류가 중단되었습니다")
+            if progress:
+                progress(done, len(retry))
             positions = [position]
             items = [{"id": 0, "count": 1,
                       "documents": [_document_hint(proposals[position][0], MAX_TEXT, root)]}]
+            # 폴더가 많으면 자주 쓰인 폴더만 후보로 보내 요청이 문맥 길이를 넘지 않게 한다.
+            # 순서는 그대로 둔다(순서만 바뀌어도 작은 모델의 답이 달라졌다).
             topics = [name for name in known if name.replace(" ", "").casefold() not in type_names]
+            if len(topics) > RETRY_KNOWN_FOLDERS:
+                used = Counter(folder for _, folder, _ in proposals)
+                keep = set(sorted(topics, key=lambda name: -used[name])[:RETRY_KNOWN_FOLDERS])
+                topics = [name for name in topics if name in keep]
             try:
                 answers = classify(items, topics)
             except (ContextSizeError, IncompleteResultError):
@@ -903,9 +923,8 @@ def assign_ai_folders(
                 for doc, folder, reason in proposals
             ]
             labelled_groups = [(group, renamed.get(name, name)) for group, name in labelled_groups]
-    subfolders = _subfolder_suggestions(eligible, labelled_groups, subdivide, should_cancel, root)
-    if progress and total:
-        progress(total * 3, total * 3)
+    stage("하위 폴더 나누기")
+    subfolders = _subfolder_suggestions(eligible, labelled_groups, subdivide, should_cancel, root, progress)
     if should_cancel and should_cancel():
         raise InterruptedError("AI 분류가 중단되었습니다")
 

@@ -44,12 +44,13 @@ def ai_preview_note(
     should_cancel: Callable[[], bool] | None = None,
     calls: dict[str, Callable] | None = None,
     source_root: Path | None = None,
+    stage: Callable[[str], None] | None = None,
 ) -> str:
     """calls에 저장소를 쓰는 Ollama 함수 묶음(local_cache.cached_ollama)을 주면 같은 질문을 다시 하지 않는다."""
     if not enabled:
         return ""
     count = assign_ai_folders(documents, progress=progress, should_cancel=should_cancel, ai_only=True,
-                              source_root=source_root, **(calls or {}))
+                              source_root=source_root, stage=stage, **(calls or {}))
     return f"AI 분류 {count}개."
 
 
@@ -70,9 +71,18 @@ def progress_text(label: str, started: float, done: int, total: int) -> str:
     return text
 
 
-def progress_reporter(events: queue.Queue, label: str) -> Callable[[int, int], None]:
-    started = time.monotonic()
-    return lambda done, total: events.put(("progress", progress_text(label, started, done, total)))
+class progress_reporter:
+    """진행 수와 남은 시간을 화면에 알린다. stage()로 단계가 바뀌면 이름과 시간 계산을 새로 시작한다."""
+
+    def __init__(self, events: queue.Queue, label: str) -> None:
+        self.events, self.label, self.started = events, label, time.monotonic()
+
+    def stage(self, label: str) -> None:
+        self.label, self.started = label, time.monotonic()
+        self.events.put(("progress", f"{label}…"))
+
+    def __call__(self, done: int, total: int) -> None:
+        self.events.put(("progress", progress_text(self.label, self.started, done, total)))
 
 def group_preview_documents(documents: list[Document], mode: str) -> dict[tuple[str, ...], list[int]]:
     """현재 필터의 파일을 폴더 경로((대분류,), (대분류, 중분류), (대분류, 중분류, 소분류))별로 묶는다."""
@@ -603,7 +613,8 @@ class OrganizerApp(tk.Tk):
                 with contextlib.ExitStack() as stack:
                     cache = stack.enter_context(LocalCache(default_cache_path())) if use_cache else None
                     calls = cached_hierarchy(cache.responses()) if cache else {}
-                    plan = add_top_level(documents, **calls)
+                    reporter = progress_reporter(self.events, "대분류로 묶는 중")
+                    plan = add_top_level(documents, stage=reporter.stage, **calls)
                 self.events.put(("grouped", documents, snapshot, plan, ""))
             except (OSError, RuntimeError, ValueError) as exc:
                 self.events.put(("grouped", None, snapshot, {}, f"대분류를 만들지 못했습니다: {exc}"))
@@ -648,9 +659,10 @@ class OrganizerApp(tk.Tk):
                         raise InterruptedError("검사가 중단되었습니다")
                     if use_ai:
                         self.events.put(("progress", "로컬 AI로 문서 임베딩과 폴더명을 계산하는 중입니다…"))
+                    reporter = progress_reporter(self.events, "로컬 AI 분류 중")
                     ai_note = ai_preview_note(
                         documents, use_ai,
-                        progress=progress_reporter(self.events, "로컬 AI 분류 중"),
+                        progress=reporter, stage=lambda name: reporter.stage(f"로컬 AI · {name}"),
                         should_cancel=self.cancel_event.is_set,
                         calls=cached_ollama(cache.responses()) if cache else None,
                         source_root=source,
