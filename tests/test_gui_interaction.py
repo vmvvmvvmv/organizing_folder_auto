@@ -171,6 +171,36 @@ class GuiInteractionTests(unittest.TestCase):
         moved = self.app.documents[5]
         self.assertEqual((moved.folder, moved.subfolder, moved.detail), ("채용", "면접", "1차"))
 
+    def test_fresh_button_reuses_reading_but_asks_ai_again(self):
+        import tempfile
+        import time
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "source"
+            source.mkdir()
+            (source / "메모.txt").write_text("출장 결과 메모", encoding="utf-8")
+            self.app.source_var.set(str(source))
+            self.app.destination_var.set(str(Path(folder) / "result"))
+            self.app.ai_var.set(False)
+            seen = {}
+
+            def fake_preview(documents, enabled, calls=None, **_options):
+                seen["enabled"] = enabled
+                return "AI 분류 0개."
+
+            with mock.patch("app.default_cache_path", return_value=Path(folder) / "cache.sqlite3"),                     mock.patch("app.ollama_missing_models", return_value=[]),                     mock.patch("app.ai_preview_note", side_effect=fake_preview),                     mock.patch("app.LocalCache.responses", autospec=True,
+                               side_effect=lambda cache, fresh=False: seen.setdefault("store_fresh", fresh) or {}):
+                self.assertEqual(self.app.fresh_button.cget("text"), "AI 분류 다시하기")
+                self.app.fresh_button.invoke()
+                deadline = time.monotonic() + 10
+                while self.app.busy and time.monotonic() < deadline:
+                    self.app.update()
+                    time.sleep(0.05)
+                self.app.update()
+            self.assertTrue(self.app.ai_var.get())  # AI 분류를 켠다
+            self.assertTrue(seen["enabled"])
+            self.assertTrue(seen["store_fresh"])  # 저장된 AI 답을 쓰지 않는 저장소로 물었다
+            self.assertIn("새로 물었습니다", self.app.status_var.get())
+
     def rename_folder_to(self, old, new, answer):
         row = next(item for item, route in self.app.folder_rows.items() if route == (old,))
         with mock.patch.object(messagebox, "askyesno", return_value=answer) as ask:

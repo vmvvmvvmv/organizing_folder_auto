@@ -69,6 +69,19 @@ class LocalCacheTests(unittest.TestCase):
         clear_cache(self.cache_path)
         self.assertFalse(self.cache_path.exists())
 
+    def test_fresh_mode_asks_again_and_saves_new_answer(self):
+        items = [{"id": 0, "documents": [], "count": 1}]
+        with mock.patch("ai_groups.ollama_classify", side_effect=[[("출장", "처음")], [("회의", "새로")]]) as chat:
+            with LocalCache(self.cache_path) as cache:
+                cached_ollama(cache.responses())["classify"](items, [])
+            with LocalCache(self.cache_path) as cache:
+                fresh = cached_ollama(cache.responses(fresh=True))["classify"]
+                self.assertEqual(fresh(items, []), [("회의", "새로")])  # 저장된 '출장'을 쓰지 않는다
+                self.assertEqual(fresh(items, []), [("회의", "새로")])  # 같은 실행 안에서는 새 답을 다시 쓴다
+            with LocalCache(self.cache_path) as cache:
+                self.assertEqual(cached_ollama(cache.responses())["classify"](items, []), [("회의", "새로")])
+        self.assertEqual(chat.call_count, 2)
+
     def test_progress_shows_remaining_time_after_a_few_seconds(self):
         with mock.patch("app.time.monotonic", return_value=130.0):
             self.assertEqual(progress_text("읽는 중", 100.0, 30, 90), "읽는 중: 30/90 · 남은 시간 약 1분")

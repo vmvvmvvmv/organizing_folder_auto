@@ -217,8 +217,14 @@ class OrganizerApp(tk.Tk):
                         variable=self.cache_var).pack(side="left")
         ttk.Button(cache_options, text="저장 내용 지우기", command=self.clear_saved_cache).pack(
             side="left", padx=8)
-        self.scan_button = ttk.Button(frame, text="분류 미리보기", command=self.start_scan)
-        self.scan_button.grid(row=3, column=0, sticky="w", pady=8)
+        scan_buttons = ttk.Frame(frame)
+        scan_buttons.grid(row=3, column=0, sticky="w", pady=8)
+        self.scan_button = ttk.Button(scan_buttons, text="분류 미리보기", command=self.start_scan)
+        self.scan_button.pack(side="left")
+        # 읽은 본문·OCR은 저장된 것을 쓰고, 로컬 AI 분류만 처음부터 다시 받는다.
+        self.fresh_button = ttk.Button(scan_buttons, text="AI 분류 다시하기",
+                                       command=lambda: self.start_scan(fresh_ai=True))
+        self.fresh_button.pack(side="left", padx=(6, 0))
         self.cancel_button = ttk.Button(frame, text="중단", command=self.cancel_current, state="disabled")
         self.cancel_button.grid(row=3, column=1, sticky="w", pady=8, padx=8)
         result_buttons = ttk.Frame(frame)
@@ -409,6 +415,7 @@ class OrganizerApp(tk.Tk):
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
         self.scan_button.configure(state="disabled" if busy else "normal")
+        self.fresh_button.configure(state="disabled" if busy else "normal")
         self.ai_checkbox.configure(state="disabled" if busy else "normal")
         self.undo_button.configure(state="disabled" if busy else "normal")
         self.group_button.configure(state="disabled" if busy or not self.documents else "normal")
@@ -600,6 +607,7 @@ class OrganizerApp(tk.Tk):
                 f"주제 폴더가 {len(topics)}개라 이미 한눈에 보입니다. {MIN_TOPICS}개 이상일 때 묶습니다.")
             return
         snapshot = [(doc.folder, doc.subfolder, doc.detail, doc.folder_reason) for doc in self.documents]
+        fresh_ai = getattr(self, "fresh_ai_last", False)
         documents = copy.deepcopy(self.documents)  # 작업 스레드는 사본만 고친다.
         use_cache = self.cache_var.get()
         self.cancel_event.clear()
@@ -612,7 +620,8 @@ class OrganizerApp(tk.Tk):
                     raise RuntimeError("AI 모델이 없습니다. '로컬 AI 분류'를 켜서 먼저 준비하세요")
                 with contextlib.ExitStack() as stack:
                     cache = stack.enter_context(LocalCache(default_cache_path())) if use_cache else None
-                    calls = cached_hierarchy(cache.responses()) if cache else {}
+                    # 'AI로 새로 분류'한 결과라면 대분류도 새로 묻는다.
+                    calls = cached_hierarchy(cache.responses(fresh=fresh_ai)) if cache else {}
                     reporter = progress_reporter(self.events, "대분류로 묶는 중")
                     plan = add_top_level(documents, stage=reporter.stage, **calls)
                 self.events.put(("grouped", documents, snapshot, plan, ""))
@@ -621,7 +630,8 @@ class OrganizerApp(tk.Tk):
 
         threading.Thread(target=work, daemon=False).start()
 
-    def start_scan(self) -> None:
+    def start_scan(self, fresh_ai: bool = False) -> None:
+        """fresh_ai=True면 읽은 본문은 저장된 것을 쓰고 AI 분류만 새로 받는다."""
         if self.busy:
             return
         paths = self._paths()
@@ -630,6 +640,10 @@ class OrganizerApp(tk.Tk):
         source, destination = paths
         use_ai = self.ai_var.get()
         use_cache = self.cache_var.get()
+        if fresh_ai:
+            self.ai_var.set(True)
+            use_ai = True
+        self.fresh_ai_last = fresh_ai
         self.documents = []
         self.preview_paths = None
         self.refresh_table()
@@ -664,7 +678,7 @@ class OrganizerApp(tk.Tk):
                         documents, use_ai,
                         progress=reporter, stage=lambda name: reporter.stage(f"로컬 AI · {name}"),
                         should_cancel=self.cancel_event.is_set,
-                        calls=cached_ollama(cache.responses()) if cache else None,
+                        calls=cached_ollama(cache.responses(fresh=fresh_ai)) if cache else None,
                         source_root=source,
                     )
                 if self.cancel_event.is_set():
@@ -675,6 +689,8 @@ class OrganizerApp(tk.Tk):
                     more = f" 외 {len(projects) - 3}개" if len(projects) > 3 else ""
                     ai_note = (f"코드 프로젝트·압축 푼 문서 폴더 {len(projects)}개({names}{more})는 그대로 둡니다. "
                                + ai_note)
+                if fresh_ai:
+                    ai_note = "저장된 AI 답 대신 새로 물었습니다. " + ai_note
                 self.events.put(("scanned", documents, paths, ai_note))
             except InterruptedError:
                 self.events.put(("cancelled_scan",))

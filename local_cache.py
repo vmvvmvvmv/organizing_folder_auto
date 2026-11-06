@@ -80,24 +80,30 @@ class LocalCache:
         self.put("text", key, json.dumps([text[:1200], method], ensure_ascii=False))
         return text, method
 
-    def responses(self) -> MutableMapping[str, dict]:
-        return _Responses(self)
+    def responses(self, fresh: bool = False) -> MutableMapping[str, dict]:
+        """fresh=True면 저장된 AI 답을 쓰지 않고 새로 묻는다. 새로 받은 답은 저장해 다음에 쓴다."""
+        return _Responses(self, fresh)
 
 
 class _Responses(MutableMapping):
     """cached_ollama가 쓰는 dict 모양의 저장소. 모델이 바뀌면 예전 응답을 쓰지 않도록 모델별로 나눈다."""
 
-    def __init__(self, cache: LocalCache) -> None:
+    def __init__(self, cache: LocalCache, fresh: bool = False) -> None:
         self.cache = cache
         self.space = f"ollama|{ai_groups.MODEL}|{ai_groups.EMBED_MODEL}"
+        self.fresh = fresh
+        self.renewed: set[str] = set()  # 이번에 새로 받은 답
 
     def __getitem__(self, key: str) -> dict:
+        if self.fresh and key not in self.renewed:
+            raise KeyError(key)  # 예전 답은 없는 것처럼 다룬다.
         value = self.cache.get(self.space, key)
         if value is None:
             raise KeyError(key)
         return json.loads(value)
 
     def __setitem__(self, key: str, value: dict) -> None:
+        self.renewed.add(key)
         self.cache.put(self.space, key, json.dumps(value, ensure_ascii=False))
 
     def __delitem__(self, key: str) -> None:
