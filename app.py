@@ -426,7 +426,7 @@ class OrganizerApp(tk.Tk):
         if self.busy:
             self.cancel_event.set()
             self.cancel_button.configure(state="disabled")
-            self.status_var.set("현재 파일 또는 관련 파일 묶음 처리가 끝나면 중단합니다…")
+            self.status_var.set("지금 처리 중인 파일까지만 하고 멈춥니다…")
 
     def request_close(self) -> None:
         if not self.busy:
@@ -434,7 +434,7 @@ class OrganizerApp(tk.Tk):
             return
         if not messagebox.askyesno(
             "작업 중 창 닫기",
-            "현재 파일 또는 관련 파일 묶음 처리가 끝나면 작업을 중단하고 창을 닫습니다. 이미 이동한 파일은 결과 폴더에 남고, 결과 기록을 저장합니다. 계속할까요?",
+            "지금 처리 중인 파일(함께 옮기는 파일 묶음이면 그 묶음)까지만 하고 창을 닫습니다. 이미 옮긴 파일은 결과 폴더에 남고 결과 기록도 저장됩니다. 닫을까요?",
         ):
             return
         self.close_requested = True
@@ -467,7 +467,7 @@ class OrganizerApp(tk.Tk):
                     "로컬 AI 준비",
                     "로컬 AI 분류에는 무료 프로그램 Ollama가 필요합니다.\n\n"
                     "Windows 패키지 관리자(winget)로 공식 Ollama를 자동 설치할까요? "
-                    "(약 1GB, 인터넷 필요. Ollama 사용권에 동의하는 것으로 처리됩니다)",
+                    "(약 1GB, 인터넷 필요. 설치하면 Ollama 사용 조건에 동의하게 됩니다)",
                 ):
                     self.start_ollama_setup(install=True)
                     return
@@ -580,7 +580,7 @@ class OrganizerApp(tk.Tk):
                 f"동일 파일 {duplicates}개 · 파일명 기준 {filename_only}개."
                 + (f" {self.scan_note}" if getattr(self, "scan_note", "") else ""))
         lines.append(quality_check(self.documents).summary())
-        lines.append(structure_score(self.documents).summary() + " (기록관리 지침 기준, 찾기 쉬운 구조인지)")
+        lines.append(structure_score(self.documents).summary() + " (기록관리 지침으로 본 찾기 쉬운 정도)")
         return "\n".join(lines)
 
     def toggle_top_level(self) -> None:
@@ -672,7 +672,7 @@ class OrganizerApp(tk.Tk):
                     if self.cancel_event.is_set():
                         raise InterruptedError("검사가 중단되었습니다")
                     if use_ai:
-                        self.events.put(("progress", "로컬 AI로 문서 임베딩과 폴더명을 계산하는 중입니다…"))
+                        self.events.put(("progress", "로컬 AI가 문서 내용을 비교하고 폴더 이름을 짓는 중입니다…"))
                     reporter = progress_reporter(self.events, "로컬 AI 분류 중")
                     ai_note = ai_preview_note(
                         documents, use_ai,
@@ -1290,7 +1290,7 @@ class OrganizerApp(tk.Tk):
                             messagebox.showerror("로컬 AI 준비", event[1])
                     else:
                         # 실행되면 바로 모델 확인으로 이어서, 없으면 받기를 묻는다.
-                        self.status_var.set("Ollama가 실행되었습니다. AI 모델을 확인하는 중입니다…")
+                        self.status_var.set("Ollama를 실행했습니다. AI 모델을 확인하는 중입니다…")
                         self.on_ai_toggle()
                 elif kind == "pulled":
                     self._set_busy(False)

@@ -31,7 +31,7 @@ class QualityCheck:
     def summary(self) -> str:
         head = (f"분류 점검: 미분류 {self.unclassified:.0%} · 사진 묶음 {self.images_unsorted:.0%} · "
                 f"작은 폴더 {self.small_folders:.0%} · 근거 약함 {self.no_evidence:.0%}")
-        return head + (" — 확인 권장: " + "; ".join(self.warnings) if self.warnings else " — 특이 신호 없음")
+        return head + (" — 확인해 보세요: " + "; ".join(self.warnings) if self.warnings else " — 눈에 띄는 문제 없음")
 
 
 def _has_evidence(doc: Document) -> bool:
