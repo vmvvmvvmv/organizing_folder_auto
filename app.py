@@ -22,7 +22,7 @@ from ollama_setup import find_ollama, install_ollama, start_ollama, wait_until_r
 from local_cache import LocalCache, cached_hierarchy, cached_ollama, clear_cache, default_cache_path
 from ai_groups import OLLAMA_DOWNLOAD, assign_ai_folders, ollama_missing_models, ollama_pull
 from organizer import Document, default_destination, move_documents, reassign_documents, rename_document, rename_detail, rename_folder, rename_subfolder, route, scan, source_files, undo_jobs, undo_report, valid_folder_name, ResultReport
-from reader import IMAGE_TYPES, MAX_FILE_BYTES, SUPPORTED, find_tesseract, ocr_status
+from reader import SUPPORTED, find_tesseract, ocr_status
 
 CONFIRM_BEFORE_OPEN = {
     ".exe", ".com", ".scr", ".msi", ".msp", ".bat", ".cmd", ".ps1",
@@ -139,19 +139,6 @@ def preview_selection(
     indices = selected_file_indices((item,))
     return [documents[indices[0]]] if indices and indices[0] < len(documents) else []
 
-
-def render_preview_image(path: Path) -> bytes | None:
-    """PDF 첫 페이지나 사진을 작은 PNG로 바꿔 원본 실행 없이 보여준다."""
-    if path.suffix.casefold() not in IMAGE_TYPES | {".pdf"} or path.stat().st_size > MAX_FILE_BYTES:
-        return None
-    import pymupdf
-
-    with pymupdf.open(path) as document:
-        if document.needs_pass or not len(document):
-            return None
-        page = document[0]
-        scale = min(760 / page.rect.width, 480 / page.rect.height, 1.0)
-        return page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False).tobytes("png")
 
 class OrganizerApp(tk.Tk):
     def __init__(self) -> None:
@@ -841,7 +828,7 @@ class OrganizerApp(tk.Tk):
         return "break"
 
     def on_table_double_click(self, event: tk.Event) -> str | None:
-        """내용을 보여줄 수 없는 파일은 Windows 기본 프로그램으로 연다."""
+        """이름 칸은 이름 바꾸기, 나머지 칸은 파일을 기본 프로그램으로 연다(폴더는 들어갈 파일 목록)."""
         if self.busy:
             return None
         item = self.table.identify_row(event.y)
@@ -1056,25 +1043,19 @@ class OrganizerApp(tk.Tk):
             messagebox.showinfo("미리보기", "선택한 항목에 파일이 없습니다")
             return
         folder_row = self.folder_rows.get(item)
-        image_bytes = None
-        preview_error = ""
         if not folder_row:
+            # 파일은 연결된 프로그램으로 바로 연다. 실행 파일 같은 형식만 먼저 묻는다.
             document = selected[0]
+            if document.source.suffix.casefold() in CONFIRM_BEFORE_OPEN:
+                if not messagebox.askyesno("파일 열기", f"{document.source.name} 파일을 열까요?"):
+                    return
             try:
-                image_bytes = render_preview_image(document.source)
-            except (OSError, RuntimeError, ValueError, tk.TclError) as exc:
-                preview_error = str(exc)
-            if not image_bytes and not document.lead_text.strip():
-                if document.source.suffix.casefold() in CONFIRM_BEFORE_OPEN:
-                    if not messagebox.askyesno("파일 열기", f"{document.source.name} 파일을 열까요?"):
-                        return
-                try:
-                    os.startfile(document.source)
-                except OSError as exc:
-                    messagebox.showerror("파일 열기", f"파일을 열지 못했습니다: {exc}")
-                return
+                os.startfile(document.source)
+            except OSError as exc:
+                messagebox.showerror("파일 열기", f"파일을 열지 못했습니다: {exc}")
+            return
         window = tk.Toplevel(self)
-        window.title("파일·폴더 미리보기")
+        window.title("폴더 미리보기")
         window.geometry("880x660")
         window.minsize(560, 380)
         window.transient(self)
@@ -1083,16 +1064,8 @@ class OrganizerApp(tk.Tk):
         outer.pack(fill="both", expand=True)
         header = ttk.Frame(outer)
         header.pack(fill="x", pady=(0, 8))
-        title = (" / ".join(part for part in folder_row if part)
-                 if folder_row else selected[0].source.name)
+        title = " / ".join(part for part in folder_row if part)
         ttk.Label(header, text=title, font=("Malgun Gothic", 12, "bold")).pack(side="left")
-        if not folder_row:
-            def open_parent() -> None:
-                try:
-                    os.startfile(selected[0].source.parent)
-                except OSError as exc:
-                    messagebox.showerror("원본 폴더", str(exc), parent=window)
-            ttk.Button(header, text="원본 위치 열기", command=open_parent).pack(side="right")
         content = ttk.Frame(outer)
         content.pack(fill="both", expand=True)
         body = tk.Text(content, wrap="word", padx=10, pady=10)
@@ -1100,37 +1073,10 @@ class OrganizerApp(tk.Tk):
         scrollbar = ttk.Scrollbar(content, orient="vertical", command=body.yview)
         scrollbar.pack(side="right", fill="y")
         body.configure(yscrollcommand=scrollbar.set)
-        if folder_row:
-            source_root = self.preview_paths[0] if self.preview_paths else Path(self.source_var.get())
-            body.insert("end", f"정리 후 이 폴더에 들어갈 파일 {len(selected)}개\n\n")
-            for doc in selected:
-                body.insert("end", f"{doc.output_name or doc.source.name}  ·  {preview_location(source_root, doc.source)}\n")
-        else:
-            doc = selected[0]
-            body.insert("end", f"원본: {doc.source}\n정리할 폴더: {doc.folder}")
-            if doc.subfolder:
-                body.insert("end", f" / {doc.subfolder}" + (f" / {doc.detail}" if doc.detail else ""))
-            if doc.output_name:
-                body.insert("end", f"\n정리할 이름: {doc.output_name}")
-            body.insert("end", f"\n분류 조건: {doc.folder_reason}\n읽기 방식: {doc.method}\n")
-            if doc.duplicate_of:
-                body.insert("end", f"중복 원본: {doc.duplicate_of}\n")
-            if doc.error:
-                body.insert("end", f"읽기 오류: {doc.error}\n")
-            if preview_error:
-                body.insert("end", f"\n화면 미리보기 실패: {preview_error}\n")
-            if image_bytes:
-                try:
-                    window.preview_photo = tk.PhotoImage(data=image_bytes)
-                    body.insert("end", "\n")
-                    body.image_create("end", image=window.preview_photo)
-                    body.insert("end", "\n")
-                except tk.TclError as exc:
-                    body.insert("end", f"\n화면 미리보기 실패: {exc}\n")
-            if doc.lead_text.strip():
-                body.insert("end", f"\n추출한 글 일부\n{doc.lead_text.strip()}\n")
-            elif not doc.error:
-                body.insert("end", "\n내용 미리보기가 없는 파일입니다. 원본 위치에서 확인하세요.\n")
+        source_root = self.preview_paths[0] if self.preview_paths else Path(self.source_var.get())
+        body.insert("end", f"정리 후 이 폴더에 들어갈 파일 {len(selected)}개\n\n")
+        for doc in selected:
+            body.insert("end", f"{doc.output_name or doc.source.name}  ·  {preview_location(source_root, doc.source)}\n")
         body.configure(state="disabled")
 
     def start_undo(self) -> None:

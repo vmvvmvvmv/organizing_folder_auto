@@ -1,9 +1,6 @@
-import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
-
-import pymupdf
 
 import app
 from organizer import Document
@@ -51,36 +48,17 @@ class FilePreviewTests(unittest.TestCase):
         self.assertEqual(confirm.call_count, 2)
         open_file.assert_called_once_with(executable)
 
-    def test_existing_text_preview_does_not_launch_file(self):
+    def test_file_with_text_also_opens_with_default_app(self):
         surface = mock.Mock()
         surface.busy = False
         surface.table.selection.return_value = ("file:0",)
         surface.folder_rows = {}
         document = Path("root/report.docx")
         surface.documents = [Document(document, "보고서", "", "DOCX 텍스트", lead_text="내용")]
-        with mock.patch.object(app.os, "startfile", create=True) as open_file, \
-             mock.patch("app.tk.Toplevel", side_effect=RuntimeError("internal preview")):
-            with self.assertRaisesRegex(RuntimeError, "internal preview"):
-                app.OrganizerApp.show_selected_preview(surface)
-        open_file.assert_not_called()
-
-    def test_image_preview_shows_first_pdf_page_and_photo_without_running_file(self):
-        render = getattr(app, "render_preview_image", lambda path: None)
-        with tempfile.TemporaryDirectory() as temporary:
-            pdf_path = Path(temporary) / "sample.pdf"
-            image_path = Path(temporary) / "sample.png"
-            with pymupdf.open() as pdf:
-                page = pdf.new_page(width=300, height=200)
-                page.insert_text((20, 40), "preview")
-                page.get_pixmap().save(image_path)
-                pdf.save(pdf_path)
-            pdf_preview = render(pdf_path)
-            image_preview = render(image_path)
-            self.assertIsNotNone(pdf_preview)
-            self.assertIsNotNone(image_preview)
-            self.assertTrue(pdf_preview.startswith(b"\x89PNG\r\n\x1a\n"))
-            self.assertTrue(image_preview.startswith(b"\x89PNG\r\n\x1a\n"))
-            self.assertIsNone(render(Path(temporary) / "shortcut.lnk"))
+        with mock.patch.object(app.os, "startfile", create=True) as open_file,              mock.patch("app.tk.Toplevel") as window:
+            app.OrganizerApp.show_selected_preview(surface)
+        open_file.assert_called_once_with(document)
+        window.assert_not_called()
 
 
 if __name__ == "__main__":
