@@ -16,15 +16,23 @@ class PreviewLayoutTests(unittest.TestCase):
 
     def test_grouping_shows_folder_counts_without_repeating_folder_per_file(self):
         groups = group_preview_documents(self.documents, "전체")
-        self.assertEqual(groups, {"출장": {"": [0, 1]}, "미분류": {"": [2]}})
-        self.assertEqual(group_preview_documents(self.documents, "미분류"), {"미분류": {"": [2]}})
+        self.assertEqual(groups, {("출장",): [0, 1], ("미분류",): [2]})
+        self.assertEqual(group_preview_documents(self.documents, "미분류"), {("미분류",): [2]})
 
     def test_second_level_grouping_keeps_top_level_files(self):
         self.documents[0].subfolder = "2017"
         self.documents[1].subfolder = "2018"
         groups = group_preview_documents(self.documents, "전체")
-        self.assertEqual(groups["출장"], {"2017": [0], "2018": [1]})
-        self.assertEqual(groups["미분류"], {"": [2]})
+        self.assertEqual(groups[("출장", "2017")], [0])
+        self.assertEqual(groups[("출장", "2018")], [1])
+        self.assertEqual(groups[("미분류",)], [2])
+
+    def test_third_level_groups_files_under_detail_folder(self):
+        self.documents[0].subfolder, self.documents[0].detail = "국내 출장", "결과 보고"
+        self.documents[1].subfolder = "국내 출장"
+        groups = group_preview_documents(self.documents, "전체")
+        self.assertEqual(groups[("출장", "국내 출장", "결과 보고")], [0])
+        self.assertEqual(groups[("출장", "국내 출장")], [1])
     def test_file_location_is_relative_and_full_path_remains_in_document(self):
         self.assertEqual(preview_location(Path("root"), self.documents[0].source), "a")
         self.assertEqual(preview_location(Path("root"), self.documents[2].source), "원본 폴더")
@@ -51,7 +59,7 @@ class PreviewLayoutTests(unittest.TestCase):
         table = mock.Mock()
         parents = {"file:2": "sub:0:1", "sub:0:1": "folder:0", "folder:0": ""}
         table.parent.side_effect = lambda item: parents[item]
-        rows = {"folder:0": ("출장", None), "sub:0:1": ("출장", "회의")}
+        rows = {"folder:0": ("출장",), "sub:0:1": ("출장", "회의")}
         self.assertEqual(drop_folder_row(table, rows, "file:2"), "sub:0:1")
         self.assertEqual(drop_folder_row(table, rows, "sub:0:1"), "sub:0:1")
         self.assertIsNone(drop_folder_row(table, rows, ""))
@@ -60,7 +68,7 @@ class PreviewLayoutTests(unittest.TestCase):
         surface = mock.Mock()
         surface.drag_target = None
         surface.drag_hover = None
-        surface.folder_rows = {"folder:0": ("출장", None)}
+        surface.folder_rows = {"folder:0": ("출장",)}
         OrganizerApp._show_drag_target(surface, "folder:0", "file:2")
         surface.table.item.assert_any_call("folder:0", tags=("folder", "drop_target"))
         surface.table.item.assert_any_call("file:2", tags=("drop_target",))

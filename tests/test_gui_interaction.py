@@ -45,7 +45,7 @@ class GuiInteractionTests(unittest.TestCase):
         x, y = self.point("file:32")
         self.send("<ButtonPress-1>", x, y)
         self.assertEqual(self.table.selection(), ("file:31", "file:32", "file:33"))
-        target = next(row for row, route in self.app.folder_rows.items() if route == ("출장", None))
+        target = next(row for row, route in self.app.folder_rows.items() if route == ("출장",))
         tx, ty = self.point(target)
         self.send("<B1-Motion>", tx, ty, state=0x100)
         self.send("<ButtonRelease-1>", tx, ty, state=0x100)
@@ -114,8 +114,95 @@ class GuiInteractionTests(unittest.TestCase):
             self.assertEqual((source / "a" / "메모.xyz").read_bytes(), b"memo")
             self.assertIn("1개 복원", self.app.status_var.get())
 
+    def test_group_button_adds_top_level_and_ungroups_back(self):
+        import time
+        self.app.documents = [
+            Document(Path(f"C:/root/주제{topic:02d}_{index}.pdf"), f"주제{topic:02d}", "AI 분류: 이유", "PDF 텍스트")
+            for topic in range(16) for index in range(3)
+        ]
+        self.app.refresh_table()
+        self.app.cache_var.set(False)  # 테스트가 사용자 프로필의 저장소를 건드리지 않게 한다
+        before = [(doc.folder, doc.subfolder) for doc in self.app.documents]
+
+        def fake_group(documents, **_calls):
+            plan = {f"주제{topic:02d}": "짝수 주제" if topic % 2 == 0 else "홀수 주제" for topic in range(16)}
+            for doc in documents:
+                doc.folder, doc.subfolder = plan[doc.folder], doc.folder
+            return plan
+
+        with mock.patch("app.add_top_level", side_effect=fake_group), \
+                mock.patch("app.ollama_missing_models", return_value=[]):
+            self.app.toggle_top_level()
+            deadline = time.monotonic() + 10
+            while self.app.busy and time.monotonic() < deadline:
+                self.app.update()
+                time.sleep(0.05)
+            self.app.update()
+        tops = [self.table.item(row, "text") for row in self.table.get_children("")]
+        self.assertEqual(tops, ["짝수 주제  (24개)", "홀수 주제  (24개)"])
+        self.assertEqual(self.app.group_button.cget("text"), "대분류 풀기")
+        self.assertIn("구조 점수", self.app.status_var.get())
+        with mock.patch.object(messagebox, "askyesno", return_value=True):
+            self.app.toggle_top_level()
+        self.assertEqual([(doc.folder, doc.subfolder) for doc in self.app.documents], before)
+        self.assertEqual(self.app.group_button.cget("text"), "대분류로 묶기")
+
+    def test_group_button_explains_when_there_are_few_topics(self):
+        with mock.patch.object(messagebox, "showinfo") as info:
+            self.app.toggle_top_level()  # 기본 데이터는 주제 폴더가 2개
+        self.assertIn("이미 한눈에", info.call_args.args[1])
+        self.assertFalse(self.app.busy)
+
+    def test_three_level_tree_and_drop_into_detail_folder(self):
+        docs = self.app.documents
+        docs[0].folder, docs[0].subfolder, docs[0].detail = "채용", "면접", "1차"
+        docs[1].folder, docs[1].subfolder = "채용", "면접"
+        self.app.refresh_table()
+        paths = set(self.app.folder_rows.values())
+        self.assertTrue({("채용",), ("채용", "면접"), ("채용", "면접", "1차")} <= paths)
+        detail_row = next(row for row, path in self.app.folder_rows.items() if path == ("채용", "면접", "1차"))
+        self.assertTrue(self.table.item(detail_row, "text").startswith("1차  (1개)"))
+        self.table.selection_set(("file:5",))
+        x, y = self.point("file:5")
+        self.send("<ButtonPress-1>", x, y)
+        tx, ty = self.point(detail_row)
+        self.send("<B1-Motion>", tx, ty, state=0x100)
+        self.send("<ButtonRelease-1>", tx, ty, state=0x100)
+        moved = self.app.documents[5]
+        self.assertEqual((moved.folder, moved.subfolder, moved.detail), ("채용", "면접", "1차"))
+
+    def test_fresh_button_reuses_reading_but_asks_ai_again(self):
+        import tempfile
+        import time
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "source"
+            source.mkdir()
+            (source / "메모.txt").write_text("출장 결과 메모", encoding="utf-8")
+            self.app.source_var.set(str(source))
+            self.app.destination_var.set(str(Path(folder) / "result"))
+            self.app.ai_var.set(False)
+            seen = {}
+
+            def fake_preview(documents, enabled, calls=None, **_options):
+                seen["enabled"] = enabled
+                return "AI 분류 0개."
+
+            with mock.patch("app.default_cache_path", return_value=Path(folder) / "cache.sqlite3"),                     mock.patch("app.ollama_missing_models", return_value=[]),                     mock.patch("app.ai_preview_note", side_effect=fake_preview),                     mock.patch("app.LocalCache.responses", autospec=True,
+                               side_effect=lambda cache, fresh=False: seen.setdefault("store_fresh", fresh) or {}):
+                self.assertEqual(self.app.fresh_button.cget("text"), "AI 분류 다시하기")
+                self.app.fresh_button.invoke()
+                deadline = time.monotonic() + 10
+                while self.app.busy and time.monotonic() < deadline:
+                    self.app.update()
+                    time.sleep(0.05)
+                self.app.update()
+            self.assertTrue(self.app.ai_var.get())  # AI 분류를 켠다
+            self.assertTrue(seen["enabled"])
+            self.assertTrue(seen["store_fresh"])  # 저장된 AI 답을 쓰지 않는 저장소로 물었다
+            self.assertIn("새로 물었습니다", self.app.status_var.get())
+
     def rename_folder_to(self, old, new, answer):
-        row = next(item for item, route in self.app.folder_rows.items() if route == (old, None))
+        row = next(item for item, route in self.app.folder_rows.items() if route == (old,))
         with mock.patch.object(messagebox, "askyesno", return_value=answer) as ask:
             self.app.begin_rename(row)
             self.app.rename_entry.delete(0, "end")

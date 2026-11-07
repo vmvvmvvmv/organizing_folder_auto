@@ -18,7 +18,7 @@ class QualityCheckTests(unittest.TestCase):
         docs.append(doc("사본.pdf", "미분류", duplicate=True))  # 중복본은 세지 않는다
         result = quality_check(docs)
         self.assertEqual(result.warnings, [])
-        self.assertIn("특이 신호 없음", result.summary())
+        self.assertIn("눈에 띄는 문제 없음", result.summary())
 
     def test_each_known_failure_signal_is_reported(self):
         docs = ([doc(f"메모{i}.pdf", "미분류") for i in range(3)]
@@ -29,7 +29,7 @@ class QualityCheckTests(unittest.TestCase):
         self.assertAlmostEqual(result.unclassified, 0.3)
         self.assertAlmostEqual(result.images_unsorted, 0.4)
         self.assertEqual((result.small_folders, result.no_evidence), (1.0, 1.0))
-        self.assertIn("확인 권장", result.summary())
+        self.assertIn("확인해 보세요", result.summary())
 
     def test_format_folders_are_not_judged_by_topic_evidence(self):
         docs = [doc(f"area{i}.shp", "GIS 자료") for i in range(3)]

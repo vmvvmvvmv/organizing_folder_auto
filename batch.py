@@ -40,6 +40,7 @@ def main() -> None:
                 "source": str(doc.source),
                 "folder": doc.folder,
                 "subfolder": doc.subfolder,
+                "detail": doc.detail,
                 "folder_reason": doc.folder_reason,
                 "method": doc.method,
                 "error": doc.error,
@@ -76,6 +77,7 @@ def main() -> None:
             item["error"], Path(item["duplicate_of"]) if item["duplicate_of"] else None,
             preview_digest=bytes.fromhex(item["sha256"]),
             subfolder=item.get("subfolder", ""),
+            detail=item.get("detail", ""),
         ))
     destination.mkdir(exist_ok=True)
     with ResultReport(source, destination, documents) as report:

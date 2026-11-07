@@ -31,12 +31,12 @@ class QualityCheck:
     def summary(self) -> str:
         head = (f"분류 점검: 미분류 {self.unclassified:.0%} · 사진 묶음 {self.images_unsorted:.0%} · "
                 f"작은 폴더 {self.small_folders:.0%} · 근거 약함 {self.no_evidence:.0%}")
-        return head + (" — 확인 권장: " + "; ".join(self.warnings) if self.warnings else " — 특이 신호 없음")
+        return head + (" — 확인해 보세요: " + "; ".join(self.warnings) if self.warnings else " — 눈에 띄는 문제 없음")
 
 
 def _has_evidence(doc: Document) -> bool:
     text = re.sub(r"[^가-힣A-Za-z]", "", f"{doc.source.stem} {doc.lead_text}").casefold()
-    names = [doc.folder, doc.subfolder] if doc.subfolder else [doc.folder]
+    names = [name for name in (doc.folder, doc.subfolder, doc.detail) if name]
     return any(term in text for name in names for term in _tokens(name))
 
 

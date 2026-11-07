@@ -12,14 +12,17 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import contextlib
+import copy
 import webbrowser
 
 from quality_score import quality_check
+from structure_score import structure_score
+from ai_hierarchy import FORMAT_FOLDERS as HIERARCHY_FORMAT_FOLDERS, MIN_TOPICS, add_top_level
 from ollama_setup import find_ollama, install_ollama, start_ollama, wait_until_running, winget_available
-from local_cache import LocalCache, cached_ollama, clear_cache, default_cache_path
+from local_cache import LocalCache, cached_hierarchy, cached_ollama, clear_cache, default_cache_path
 from ai_groups import OLLAMA_DOWNLOAD, assign_ai_folders, ollama_missing_models, ollama_pull
-from organizer import Document, default_destination, move_documents, reassign_documents, rename_document, rename_folder, rename_subfolder, scan, source_files, undo_jobs, undo_report, valid_folder_name, ResultReport
-from reader import IMAGE_TYPES, MAX_FILE_BYTES, SUPPORTED, find_tesseract, ocr_status
+from organizer import Document, default_destination, move_documents, reassign_documents, rename_document, rename_detail, rename_folder, rename_subfolder, route, scan, source_files, undo_jobs, undo_report, valid_folder_name, ResultReport
+from reader import SUPPORTED, find_tesseract, ocr_status
 
 CONFIRM_BEFORE_OPEN = {
     ".exe", ".com", ".scr", ".msi", ".msp", ".bat", ".cmd", ".ps1",
@@ -41,12 +44,13 @@ def ai_preview_note(
     should_cancel: Callable[[], bool] | None = None,
     calls: dict[str, Callable] | None = None,
     source_root: Path | None = None,
+    stage: Callable[[str], None] | None = None,
 ) -> str:
     """calls에 저장소를 쓰는 Ollama 함수 묶음(local_cache.cached_ollama)을 주면 같은 질문을 다시 하지 않는다."""
     if not enabled:
         return ""
     count = assign_ai_folders(documents, progress=progress, should_cancel=should_cancel, ai_only=True,
-                              source_root=source_root, **(calls or {}))
+                              source_root=source_root, stage=stage, **(calls or {}))
     return f"AI 분류 {count}개."
 
 
@@ -67,13 +71,22 @@ def progress_text(label: str, started: float, done: int, total: int) -> str:
     return text
 
 
-def progress_reporter(events: queue.Queue, label: str) -> Callable[[int, int], None]:
-    started = time.monotonic()
-    return lambda done, total: events.put(("progress", progress_text(label, started, done, total)))
+class progress_reporter:
+    """진행 수와 남은 시간을 화면에 알린다. stage()로 단계가 바뀌면 이름과 시간 계산을 새로 시작한다."""
 
-def group_preview_documents(documents: list[Document], mode: str) -> dict[str, dict[str, list[int]]]:
-    """현재 필터의 파일을 주제와 하위 폴더별로 묶는다."""
-    groups: dict[str, dict[str, list[int]]] = {}
+    def __init__(self, events: queue.Queue, label: str) -> None:
+        self.events, self.label, self.started = events, label, time.monotonic()
+
+    def stage(self, label: str) -> None:
+        self.label, self.started = label, time.monotonic()
+        self.events.put(("progress", f"{label}…"))
+
+    def __call__(self, done: int, total: int) -> None:
+        self.events.put(("progress", progress_text(self.label, self.started, done, total)))
+
+def group_preview_documents(documents: list[Document], mode: str) -> dict[tuple[str, ...], list[int]]:
+    """현재 필터의 파일을 폴더 경로((대분류,), (대분류, 중분류), (대분류, 중분류, 소분류))별로 묶는다."""
+    groups: dict[tuple[str, ...], list[int]] = {}
     for index, doc in enumerate(documents):
         visible = (
             mode == "전체"
@@ -83,7 +96,8 @@ def group_preview_documents(documents: list[Document], mode: str) -> dict[str, d
             or (mode == "파일명 기준" and doc.source.suffix.lower() not in SUPPORTED)
         )
         if visible:
-            groups.setdefault(doc.folder or "미분류", {}).setdefault(doc.subfolder, []).append(index)
+            path = route(doc) if doc.folder else ("미분류",)
+            groups.setdefault(path, []).append(index)
     return groups
 
 
@@ -101,7 +115,7 @@ def selected_file_indices(items: tuple[str, ...]) -> list[int]:
     return [int(item[5:]) for item in items if item.startswith("file:") and item[5:].isdigit()]
 
 def drop_folder_row(
-    table: ttk.Treeview, folder_rows: dict[str, tuple[str, str | None]], item: str,
+    table: ttk.Treeview, folder_rows: dict[str, tuple[str, ...]], item: str,
 ) -> str | None:
     """폴더 안의 파일 행에 놓아도 가장 가까운 부모 폴더를 대상으로 삼는다."""
     while item:
@@ -111,30 +125,20 @@ def drop_folder_row(
     return None
 
 
+def in_folder(doc: Document, path: tuple[str, ...]) -> bool:
+    """파일이 그 폴더 경로 안(아래 단계 포함)에 들어가는지."""
+    return route(doc)[:len(path)] == path
+
+
 def preview_selection(
-    documents: list[Document], folder_rows: dict[str, tuple[str, str | None]], item: str,
+    documents: list[Document], folder_rows: dict[str, tuple[str, ...]], item: str,
 ) -> list[Document]:
     """선택한 파일 또는 제안 폴더에 들어갈 파일을 돌려준다."""
     if item in folder_rows:
-        folder, subfolder = folder_rows[item]
-        return [doc for doc in documents
-                if doc.folder == folder and (subfolder is None or doc.subfolder == subfolder)]
+        return [doc for doc in documents if in_folder(doc, folder_rows[item])]
     indices = selected_file_indices((item,))
     return [documents[indices[0]]] if indices and indices[0] < len(documents) else []
 
-
-def render_preview_image(path: Path) -> bytes | None:
-    """PDF 첫 페이지나 사진을 작은 PNG로 바꿔 원본 실행 없이 보여준다."""
-    if path.suffix.casefold() not in IMAGE_TYPES | {".pdf"} or path.stat().st_size > MAX_FILE_BYTES:
-        return None
-    import pymupdf
-
-    with pymupdf.open(path) as document:
-        if document.needs_pass or not len(document):
-            return None
-        page = document[0]
-        scale = min(760 / page.rect.width, 480 / page.rect.height, 1.0)
-        return page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False).tobytes("png")
 
 class OrganizerApp(tk.Tk):
     def __init__(self) -> None:
@@ -143,7 +147,7 @@ class OrganizerApp(tk.Tk):
         self.geometry("1060x650")
         self.minsize(780, 480)
         self.documents: list[Document] = []
-        self.folder_rows: dict[str, tuple[str, str | None]] = {}
+        self.folder_rows: dict[str, tuple[str, ...]] = {}
         self.drag_origin: tuple[int, int] | None = None
         self.drag_indices: list[int] = []
         self.drag_active = False
@@ -174,6 +178,8 @@ class OrganizerApp(tk.Tk):
         self.rename_item: str | None = None
         self.context_item: str | None = None
         self.ai_var = tk.BooleanVar(value=False)
+        # 대분류로 묶기 전의 (폴더, 하위 폴더, 분류 이유). 묶기를 풀 때 되돌린다.
+        self.grouped_snapshot: list[tuple[str, str, str, str]] | None = None
         self.cache_var = tk.BooleanVar(value=True)
 
         frame = ttk.Frame(self, padding=14)
@@ -198,8 +204,14 @@ class OrganizerApp(tk.Tk):
                         variable=self.cache_var).pack(side="left")
         ttk.Button(cache_options, text="저장 내용 지우기", command=self.clear_saved_cache).pack(
             side="left", padx=8)
-        self.scan_button = ttk.Button(frame, text="분류 미리보기", command=self.start_scan)
-        self.scan_button.grid(row=3, column=0, sticky="w", pady=8)
+        scan_buttons = ttk.Frame(frame)
+        scan_buttons.grid(row=3, column=0, sticky="w", pady=8)
+        self.scan_button = ttk.Button(scan_buttons, text="분류 미리보기", command=self.start_scan)
+        self.scan_button.pack(side="left")
+        # 읽은 본문·OCR은 저장된 것을 쓰고, 로컬 AI 분류만 처음부터 다시 받는다.
+        self.fresh_button = ttk.Button(scan_buttons, text="AI 분류 다시하기",
+                                       command=lambda: self.start_scan(fresh_ai=True))
+        self.fresh_button.pack(side="left", padx=(6, 0))
         self.cancel_button = ttk.Button(frame, text="중단", command=self.cancel_current, state="disabled")
         self.cancel_button.grid(row=3, column=1, sticky="w", pady=8, padx=8)
         result_buttons = ttk.Frame(frame)
@@ -227,6 +239,9 @@ class OrganizerApp(tk.Tk):
         ttk.Label(filters, textvariable=self.count_var).pack(side="left")
         ttk.Button(filters, text="모두 접기", command=lambda: self.set_all_folders_open(False)).pack(side="right")
         ttk.Button(filters, text="보기", command=self.show_selected_preview).pack(side="right", padx=6)
+        self.group_button = ttk.Button(filters, text="대분류로 묶기", command=self.toggle_top_level,
+                                       state="disabled")
+        self.group_button.pack(side="right", padx=6)
         ttk.Button(filters, text="모두 펼치기", command=lambda: self.set_all_folders_open(True)).pack(
             side="right", padx=6
         )
@@ -298,31 +313,33 @@ class OrganizerApp(tk.Tk):
         self.refresh_table()
 
     def set_all_folders_open(self, opened: bool) -> None:
-        for top in self.table.get_children(""):
-            self.table.item(top, open=opened)
-            for child in self.table.get_children(top):
-                if child in self.folder_rows:
-                    self.table.item(child, open=opened)
+        for item in self.folder_rows:
+            self.table.item(item, open=opened)
 
     def refresh_table(self) -> None:
         selected = set(self.table.selection())
-        selected_folders = {self.folder_rows[item] for item in selected if item in self.folder_rows}
-        open_folders = {
-            name for item, name in self.folder_rows.items() if self.table.item(item, "open")
-        }
+        selected_paths = {self.folder_rows[item] for item in selected if item in self.folder_rows}
+        open_paths = {path for item, path in self.folder_rows.items() if self.table.item(item, "open")}
         self.table.delete(*self.table.get_children())
         self.folder_rows.clear()
-        groups = group_preview_documents(self.documents, self.filter_var.get())
+        routes = group_preview_documents(self.documents, self.filter_var.get())
         source_root = self.preview_paths[0] if self.preview_paths else Path(self.source_var.get() or ".")
         keys = {
             "category": lambda doc: (doc.folder.casefold(), (doc.output_name or doc.source.name).casefold()),
             "source": lambda doc: ((doc.output_name or doc.source.name).casefold(), str(doc.source).casefold()),
             "method": lambda doc: ((doc.error or doc.method).casefold(), doc.source.name.casefold()),
         }
-        folders = sorted(
-            groups, key=lambda name: (name != "미분류", name.casefold()),
-            reverse=self.sort_reverse if self.sort_key == "category" else False,
-        )
+        # 폴더 경로마다 바로 들어 있는 파일, 바로 아래 폴더, 아래 단계까지 합한 파일 수를 센다.
+        children: dict[tuple[str, ...], set[str]] = {}
+        totals: dict[tuple[str, ...], int] = {}
+        selected_under: set[tuple[str, ...]] = set()
+        for path, indices in routes.items():
+            has_selected = any(f"file:{index}" in selected for index in indices)
+            for depth in range(1, len(path) + 1):
+                children.setdefault(path[:depth - 1], set()).add(path[depth - 1])
+                totals[path[:depth]] = totals.get(path[:depth], 0) + len(indices)
+                if has_selected:
+                    selected_under.add(path[:depth])
         restore = []
 
         def insert_files(parent: str, indices: list[int]) -> None:
@@ -341,47 +358,28 @@ class OrganizerApp(tk.Tk):
                 if file_item in selected:
                     restore.append(file_item)
 
-        for position, folder in enumerate(folders):
-            children = groups[folder]
-            all_indices = [index for indices in children.values() for index in indices]
-            folder_item = f"folder:{position}"
-            top_key = (folder, None)
-            self.folder_rows[folder_item] = top_key
-            opened = (
-                top_key in open_folders or len(groups) == 1
-                or any(f"file:{index}" in selected for index in all_indices)
-            )
-            self.table.insert(
-                "", "end", iid=folder_item, text=f"{folder}  ({len(all_indices)}개)",
-                values=("", ""), open=opened, tags=("folder",),
-            )
-            if top_key in selected_folders:
-                restore.append(folder_item)
-            insert_files(folder_item, children.get("", []))
-            for child_position, subfolder in enumerate(
-                sorted(name for name in children if name)
-            ):
-                indices = children[subfolder]
-                child_item = f"sub:{position}:{child_position}"
-                child_key = (folder, subfolder)
-                self.folder_rows[child_item] = child_key
-                child_open = (
-                    child_key in open_folders
-                    or any(f"file:{index}" in selected for index in indices)
-                )
-                self.table.insert(
-                    folder_item, "end", iid=child_item,
-                    text=f"{subfolder}  ({len(indices)}개)",
-                    values=("", ""), open=child_open, tags=("folder",),
-                )
-                if child_key in selected_folders:
-                    restore.append(child_item)
-                insert_files(child_item, indices)
+        top_names = children.get((), set())
+
+        def insert_folder(parent: str, path: tuple[str, ...]) -> None:
+            item = f"folder:{len(self.folder_rows)}"
+            self.folder_rows[item] = path
+            opened = (path in open_paths or path in selected_under
+                      or (len(path) == 1 and len(top_names) == 1))
+            self.table.insert(parent, "end", iid=item, text=f"{path[-1]}  ({totals[path]}개)",
+                              values=("", ""), open=opened, tags=("folder",))
+            if path in selected_paths:
+                restore.append(item)
+            insert_files(item, routes.get(path, []))
+            for name in sorted(children.get(path, set()), key=str.casefold):
+                insert_folder(item, path + (name,))
+
+        for name in sorted(top_names, key=lambda name: (name != "미분류", name.casefold()),
+                           reverse=self.sort_reverse if self.sort_key == "category" else False):
+            insert_folder("", (name,))
         if restore:
             self.table.selection_set(restore)
-        count = sum(len(indices) for children in groups.values() for indices in children.values())
-        folder_count = sum(1 + sum(bool(name) for name in children) for children in groups.values())
-        self.count_var.set(f"{folder_count}개 폴더 · {count}/{len(self.documents)}개 파일")
+        count = sum(len(indices) for indices in routes.values())
+        self.count_var.set(f"{len(self.folder_rows)}개 폴더 · {count}/{len(self.documents)}개 파일")
         if not restore:
             self.detail_var.set("")
 
@@ -404,8 +402,10 @@ class OrganizerApp(tk.Tk):
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
         self.scan_button.configure(state="disabled" if busy else "normal")
+        self.fresh_button.configure(state="disabled" if busy else "normal")
         self.ai_checkbox.configure(state="disabled" if busy else "normal")
         self.undo_button.configure(state="disabled" if busy else "normal")
+        self.group_button.configure(state="disabled" if busy or not self.documents else "normal")
         self.move_button.configure(state="disabled" if busy or not self.documents or self.preview_paths is None else "normal")
         self.cancel_button.configure(state="normal" if busy and not self.cancel_event.is_set() else "disabled")
 
@@ -413,7 +413,7 @@ class OrganizerApp(tk.Tk):
         if self.busy:
             self.cancel_event.set()
             self.cancel_button.configure(state="disabled")
-            self.status_var.set("현재 파일 또는 관련 파일 묶음 처리가 끝나면 중단합니다…")
+            self.status_var.set("지금 처리 중인 파일까지만 하고 멈춥니다…")
 
     def request_close(self) -> None:
         if not self.busy:
@@ -421,7 +421,7 @@ class OrganizerApp(tk.Tk):
             return
         if not messagebox.askyesno(
             "작업 중 창 닫기",
-            "현재 파일 또는 관련 파일 묶음 처리가 끝나면 작업을 중단하고 창을 닫습니다. 이미 이동한 파일은 결과 폴더에 남고, 결과 기록을 저장합니다. 계속할까요?",
+            "지금 처리 중인 파일(함께 옮기는 파일 묶음이면 그 묶음)까지만 하고 창을 닫습니다. 이미 옮긴 파일은 결과 폴더에 남고 결과 기록도 저장됩니다. 닫을까요?",
         ):
             return
         self.close_requested = True
@@ -454,7 +454,7 @@ class OrganizerApp(tk.Tk):
                     "로컬 AI 준비",
                     "로컬 AI 분류에는 무료 프로그램 Ollama가 필요합니다.\n\n"
                     "Windows 패키지 관리자(winget)로 공식 Ollama를 자동 설치할까요? "
-                    "(약 1GB, 인터넷 필요. Ollama 사용권에 동의하는 것으로 처리됩니다)",
+                    "(약 1GB, 인터넷 필요. 설치하면 Ollama 사용 조건에 동의하게 됩니다)",
                 ):
                     self.start_ollama_setup(install=True)
                     return
@@ -552,7 +552,73 @@ class OrganizerApp(tk.Tk):
             return
         self.status_var.set("저장한 내용을 지웠습니다")
 
-    def start_scan(self) -> None:
+    def preview_summary(self, counts: bool = True) -> str:
+        """미리보기 요약: 개수, 확인 권장 신호, 구조 점수."""
+        lines = []
+        if counts:
+            unknown = sum(doc.folder == "미분류" for doc in self.documents)
+            failed = sum(bool(document.error) for document in self.documents)
+            duplicates = sum(document.duplicate_of is not None for document in self.documents)
+            filename_only = sum(document.source.suffix.lower() not in SUPPORTED for document in self.documents)
+            folder_count = len({doc.folder for doc in self.documents if doc.folder and doc.folder != "미분류"})
+            lines.append(
+                f"{len(self.documents)}개 확인 · 제안 폴더 {folder_count}개 · "
+                f"미분류 {unknown}개 · 읽기 실패 {failed}개 · "
+                f"동일 파일 {duplicates}개 · 파일명 기준 {filename_only}개."
+                + (f" {self.scan_note}" if getattr(self, "scan_note", "") else ""))
+        lines.append(quality_check(self.documents).summary())
+        lines.append(structure_score(self.documents).summary() + " (기록관리 지침으로 본 찾기 쉬운 정도)")
+        return "\n".join(lines)
+
+    def toggle_top_level(self) -> None:
+        """세부 주제 폴더를 AI가 만든 대분류 아래로 묶거나, 묶기 전으로 되돌린다."""
+        if self.busy or not self.documents:
+            return
+        if self.grouped_snapshot is not None:
+            if not messagebox.askyesno(
+                "대분류 풀기", "대분류를 풀면 묶은 뒤 바꾼 분류도 묶기 전 상태로 돌아갑니다. 풀까요?",
+            ):
+                return
+            for doc, (folder, subfolder, detail, reason) in zip(self.documents, self.grouped_snapshot):
+                doc.folder, doc.subfolder, doc.detail, doc.folder_reason = folder, subfolder, detail, reason
+            self.grouped_snapshot = None
+            self.group_button.configure(text="대분류로 묶기")
+            self.refresh_table()
+            self.status_var.set("대분류를 풀었습니다.\n" + self.preview_summary(counts=False))
+            return
+        topics = {doc.folder for doc in self.documents if doc.duplicate_of is None
+                  and doc.folder not in {"", "미분류"} and doc.folder not in HIERARCHY_FORMAT_FOLDERS}
+        if len(topics) < MIN_TOPICS:
+            messagebox.showinfo(
+                "대분류로 묶기",
+                f"주제 폴더가 {len(topics)}개라 이미 한눈에 보입니다. {MIN_TOPICS}개 이상일 때 묶습니다.")
+            return
+        snapshot = [(doc.folder, doc.subfolder, doc.detail, doc.folder_reason) for doc in self.documents]
+        fresh_ai = getattr(self, "fresh_ai_last", False)
+        documents = copy.deepcopy(self.documents)  # 작업 스레드는 사본만 고친다.
+        use_cache = self.cache_var.get()
+        self.cancel_event.clear()
+        self._set_busy(True)
+        self.status_var.set("AI로 대분류를 만드는 중입니다…")
+
+        def work() -> None:
+            try:
+                if ollama_missing_models():
+                    raise RuntimeError("AI 모델이 없습니다. '로컬 AI 분류'를 켜서 먼저 준비하세요")
+                with contextlib.ExitStack() as stack:
+                    cache = stack.enter_context(LocalCache(default_cache_path())) if use_cache else None
+                    # 'AI로 새로 분류'한 결과라면 대분류도 새로 묻는다.
+                    calls = cached_hierarchy(cache.responses(fresh=fresh_ai)) if cache else {}
+                    reporter = progress_reporter(self.events, "대분류로 묶는 중")
+                    plan = add_top_level(documents, stage=reporter.stage, **calls)
+                self.events.put(("grouped", documents, snapshot, plan, ""))
+            except (OSError, RuntimeError, ValueError) as exc:
+                self.events.put(("grouped", None, snapshot, {}, f"대분류를 만들지 못했습니다: {exc}"))
+
+        threading.Thread(target=work, daemon=False).start()
+
+    def start_scan(self, fresh_ai: bool = False) -> None:
+        """fresh_ai=True면 읽은 본문은 저장된 것을 쓰고 AI 분류만 새로 받는다."""
         if self.busy:
             return
         paths = self._paths()
@@ -561,6 +627,10 @@ class OrganizerApp(tk.Tk):
         source, destination = paths
         use_ai = self.ai_var.get()
         use_cache = self.cache_var.get()
+        if fresh_ai:
+            self.ai_var.set(True)
+            use_ai = True
+        self.fresh_ai_last = fresh_ai
         self.documents = []
         self.preview_paths = None
         self.refresh_table()
@@ -589,12 +659,13 @@ class OrganizerApp(tk.Tk):
                     if self.cancel_event.is_set():
                         raise InterruptedError("검사가 중단되었습니다")
                     if use_ai:
-                        self.events.put(("progress", "로컬 AI로 문서 임베딩과 폴더명을 계산하는 중입니다…"))
+                        self.events.put(("progress", "로컬 AI가 문서 내용을 비교하고 폴더 이름을 짓는 중입니다…"))
+                    reporter = progress_reporter(self.events, "로컬 AI 분류 중")
                     ai_note = ai_preview_note(
                         documents, use_ai,
-                        progress=progress_reporter(self.events, "로컬 AI 분류 중"),
+                        progress=reporter, stage=lambda name: reporter.stage(f"로컬 AI · {name}"),
                         should_cancel=self.cancel_event.is_set,
-                        calls=cached_ollama(cache.responses()) if cache else None,
+                        calls=cached_ollama(cache.responses(fresh=fresh_ai)) if cache else None,
                         source_root=source,
                     )
                 if self.cancel_event.is_set():
@@ -605,6 +676,8 @@ class OrganizerApp(tk.Tk):
                     more = f" 외 {len(projects) - 3}개" if len(projects) > 3 else ""
                     ai_note = (f"코드 프로젝트·압축 푼 문서 폴더 {len(projects)}개({names}{more})는 그대로 둡니다. "
                                + ai_note)
+                if fresh_ai:
+                    ai_note = "저장된 AI 답 대신 새로 물었습니다. " + ai_note
                 self.events.put(("scanned", documents, paths, ai_note))
             except InterruptedError:
                 self.events.put(("cancelled_scan",))
@@ -672,9 +745,7 @@ class OrganizerApp(tk.Tk):
         else:
             label = f"{len(self.drag_indices)}개 파일"
         if target:
-            folder, subfolder = self.folder_rows[target]
-            destination = folder if not subfolder else f"{folder} / {subfolder}"
-            label += f"  →  {destination}"
+            label += f"  →  {' / '.join(self.folder_rows[target])}"
         self.drag_preview_label.configure(
             text=label, bg="#d8f2dc" if target else "#e7f1fb",
         )
@@ -750,15 +821,14 @@ class OrganizerApp(tk.Tk):
         if not target or self.busy:
             self.status_var.set("폴더 안에 놓으세요")
             return "break"
-        folder, subfolder = target
-        changed = reassign_documents(self.documents, indices, folder, subfolder or "")
+        folder, subfolder, detail = (*target, "", "")[:3]
+        changed = reassign_documents(self.documents, indices, folder, subfolder, detail)
         self.refresh_table()
-        display = folder if not subfolder else f"{folder} / {subfolder}"
-        self.status_var.set(f"{len(changed)}개 파일 → {display}")
+        self.status_var.set(f"{len(changed)}개 파일 → {' / '.join(target)}")
         return "break"
 
     def on_table_double_click(self, event: tk.Event) -> str | None:
-        """내용을 보여줄 수 없는 파일은 Windows 기본 프로그램으로 연다."""
+        """이름 칸은 이름 바꾸기, 나머지 칸은 파일을 기본 프로그램으로 연다(폴더는 들어갈 파일 목록)."""
         if self.busy:
             return None
         item = self.table.identify_row(event.y)
@@ -807,9 +877,9 @@ class OrganizerApp(tk.Tk):
         if self.busy or not self.table.exists(item):
             return
         self.cancel_rename()
-        route = self.folder_rows.get(item)
-        if route:
-            current = route[0] if route[1] is None else route[1]
+        path = self.folder_rows.get(item)
+        if path:
+            current = path[-1]
         else:
             indices = selected_file_indices((item,))
             if not indices:
@@ -875,30 +945,26 @@ class OrganizerApp(tk.Tk):
         if not name or not item:
             return "break"
         try:
-            route = self.folder_rows.get(item)
-            if route:
-                folder, subfolder = route
-                # 이미 있는 폴더 이름으로 바꾸면 두 폴더가 합쳐지므로 먼저 묻는다.
-                key = name.casefold()
-                if subfolder is None:
-                    existing = any(doc.folder != folder and doc.folder.casefold() == key
-                                   for doc in self.documents)
-                else:
-                    existing = any(doc.folder == folder and doc.subfolder != subfolder
-                                   and doc.subfolder.casefold() == key
-                                   for doc in self.documents)
+            path = self.folder_rows.get(item)
+            if path:
+                # 같은 위치에 이미 있는 폴더 이름으로 바꾸면 두 폴더가 합쳐지므로 먼저 묻는다.
+                key, depth = name.casefold(), len(path)
+                existing = any(
+                    len(route(doc)) >= depth and route(doc)[:depth - 1] == path[:-1]
+                    and route(doc)[depth - 1] != path[-1] and route(doc)[depth - 1].casefold() == key
+                    for doc in self.documents)
                 if existing and not messagebox.askyesno(
                     "폴더 합치기", f"'{name}' 폴더가 이미 있습니다. 두 폴더를 합칠까요?",
                 ):
                     return "break"
-                if subfolder is None:
-                    if name != folder:
-                        rename_folder(self.documents, folder, name)
-                    new_route = (name, None)
-                else:
-                    if name != subfolder:
-                        rename_subfolder(self.documents, folder, subfolder, name)
-                    new_route = (folder, name)
+                if name != path[-1]:
+                    if depth == 1:
+                        rename_folder(self.documents, path[0], name)
+                    elif depth == 2:
+                        rename_subfolder(self.documents, path[0], path[1], name)
+                    else:
+                        rename_detail(self.documents, path[0], path[1], path[2], name)
+                new_route = path[:-1] + (name,)
             else:
                 indices = selected_file_indices((item,))
                 if not indices:
@@ -955,13 +1021,9 @@ class OrganizerApp(tk.Tk):
             return
         item = selected[0]
         if item in self.folder_rows:
-            folder, subfolder = self.folder_rows[item]
-            count = sum(
-                doc.folder == folder and (subfolder is None or doc.subfolder == subfolder)
-                for doc in self.documents
-            )
-            display = folder if subfolder is None else f"{folder} / {subfolder}"
-            self.detail_var.set(f"폴더: {display} · {count}개 파일")
+            path = self.folder_rows[item]
+            count = sum(in_folder(doc, path) for doc in self.documents)
+            self.detail_var.set(f"폴더: {' / '.join(path)} · {count}개 파일")
             return
         indices = selected_file_indices((item,))
         if indices:
@@ -981,25 +1043,19 @@ class OrganizerApp(tk.Tk):
             messagebox.showinfo("미리보기", "선택한 항목에 파일이 없습니다")
             return
         folder_row = self.folder_rows.get(item)
-        image_bytes = None
-        preview_error = ""
         if not folder_row:
+            # 파일은 연결된 프로그램으로 바로 연다. 실행 파일 같은 형식만 먼저 묻는다.
             document = selected[0]
+            if document.source.suffix.casefold() in CONFIRM_BEFORE_OPEN:
+                if not messagebox.askyesno("파일 열기", f"{document.source.name} 파일을 열까요?"):
+                    return
             try:
-                image_bytes = render_preview_image(document.source)
-            except (OSError, RuntimeError, ValueError, tk.TclError) as exc:
-                preview_error = str(exc)
-            if not image_bytes and not document.lead_text.strip():
-                if document.source.suffix.casefold() in CONFIRM_BEFORE_OPEN:
-                    if not messagebox.askyesno("파일 열기", f"{document.source.name} 파일을 열까요?"):
-                        return
-                try:
-                    os.startfile(document.source)
-                except OSError as exc:
-                    messagebox.showerror("파일 열기", f"파일을 열지 못했습니다: {exc}")
-                return
+                os.startfile(document.source)
+            except OSError as exc:
+                messagebox.showerror("파일 열기", f"파일을 열지 못했습니다: {exc}")
+            return
         window = tk.Toplevel(self)
-        window.title("파일·폴더 미리보기")
+        window.title("폴더 미리보기")
         window.geometry("880x660")
         window.minsize(560, 380)
         window.transient(self)
@@ -1008,16 +1064,8 @@ class OrganizerApp(tk.Tk):
         outer.pack(fill="both", expand=True)
         header = ttk.Frame(outer)
         header.pack(fill="x", pady=(0, 8))
-        title = (" / ".join(part for part in folder_row if part)
-                 if folder_row else selected[0].source.name)
+        title = " / ".join(part for part in folder_row if part)
         ttk.Label(header, text=title, font=("Malgun Gothic", 12, "bold")).pack(side="left")
-        if not folder_row:
-            def open_parent() -> None:
-                try:
-                    os.startfile(selected[0].source.parent)
-                except OSError as exc:
-                    messagebox.showerror("원본 폴더", str(exc), parent=window)
-            ttk.Button(header, text="원본 위치 열기", command=open_parent).pack(side="right")
         content = ttk.Frame(outer)
         content.pack(fill="both", expand=True)
         body = tk.Text(content, wrap="word", padx=10, pady=10)
@@ -1025,37 +1073,10 @@ class OrganizerApp(tk.Tk):
         scrollbar = ttk.Scrollbar(content, orient="vertical", command=body.yview)
         scrollbar.pack(side="right", fill="y")
         body.configure(yscrollcommand=scrollbar.set)
-        if folder_row:
-            source_root = self.preview_paths[0] if self.preview_paths else Path(self.source_var.get())
-            body.insert("end", f"정리 후 이 폴더에 들어갈 파일 {len(selected)}개\n\n")
-            for doc in selected:
-                body.insert("end", f"{doc.output_name or doc.source.name}  ·  {preview_location(source_root, doc.source)}\n")
-        else:
-            doc = selected[0]
-            body.insert("end", f"원본: {doc.source}\n정리할 폴더: {doc.folder}")
-            if doc.subfolder:
-                body.insert("end", f" / {doc.subfolder}")
-            if doc.output_name:
-                body.insert("end", f"\n정리할 이름: {doc.output_name}")
-            body.insert("end", f"\n분류 조건: {doc.folder_reason}\n읽기 방식: {doc.method}\n")
-            if doc.duplicate_of:
-                body.insert("end", f"중복 원본: {doc.duplicate_of}\n")
-            if doc.error:
-                body.insert("end", f"읽기 오류: {doc.error}\n")
-            if preview_error:
-                body.insert("end", f"\n화면 미리보기 실패: {preview_error}\n")
-            if image_bytes:
-                try:
-                    window.preview_photo = tk.PhotoImage(data=image_bytes)
-                    body.insert("end", "\n")
-                    body.image_create("end", image=window.preview_photo)
-                    body.insert("end", "\n")
-                except tk.TclError as exc:
-                    body.insert("end", f"\n화면 미리보기 실패: {exc}\n")
-            if doc.lead_text.strip():
-                body.insert("end", f"\n추출한 글 일부\n{doc.lead_text.strip()}\n")
-            elif not doc.error:
-                body.insert("end", "\n내용 미리보기가 없는 파일입니다. 원본 위치에서 확인하세요.\n")
+        source_root = self.preview_paths[0] if self.preview_paths else Path(self.source_var.get())
+        body.insert("end", f"정리 후 이 폴더에 들어갈 파일 {len(selected)}개\n\n")
+        for doc in selected:
+            body.insert("end", f"{doc.output_name or doc.source.name}  ·  {preview_location(source_root, doc.source)}\n")
         body.configure(state="disabled")
 
     def start_undo(self) -> None:
@@ -1154,20 +1175,32 @@ class OrganizerApp(tk.Tk):
                 elif kind == "scanned":
                     self.documents = event[1]
                     self.preview_paths = event[2]
+                    self.grouped_snapshot = None
+                    self.group_button.configure(text="대분류로 묶기")
                     self.refresh_table()
-                    unknown = sum(doc.folder == "미분류" for doc in self.documents)
-                    failed = sum(bool(document.error) for document in self.documents)
-                    duplicates = sum(document.duplicate_of is not None for document in self.documents)
-                    filename_only = sum(document.source.suffix.lower() not in SUPPORTED for document in self.documents)
-                    folder_count = len({doc.folder for doc in self.documents if doc.folder and doc.folder != "미분류"})
-                    self.status_var.set(
-                        f"{len(self.documents)}개 확인 · 제안 폴더 {folder_count}개 · "
-                        f"미분류 {unknown}개 · 읽기 실패 {failed}개 · "
-                        f"동일 파일 {duplicates}개 · 파일명 기준 {filename_only}개."
-                        + (f" {event[3]}" if event[3] else "")
-                        + f"\n{quality_check(self.documents).summary()}"
-                    )
+                    self.scan_note = event[3]
+                    self.status_var.set(self.preview_summary())
                     self._set_busy(False)
+                elif kind == "grouped":
+                    grouped, snapshot, plan, error = event[1:]
+                    self._set_busy(False)
+                    if error:
+                        self.status_var.set(error)
+                        if not self.close_requested:
+                            messagebox.showerror("대분류로 묶기", error)
+                    elif not plan:
+                        self.status_var.set("묶을 만한 대분류를 찾지 못해 그대로 두었습니다")
+                        if not self.close_requested:
+                            messagebox.showinfo("대분류로 묶기", "묶을 만한 대분류를 찾지 못해 그대로 두었습니다.")
+                    else:
+                        self.documents = grouped
+                        self.grouped_snapshot = snapshot
+                        self.group_button.configure(text="대분류 풀기")
+                        self.refresh_table()
+                        self.status_var.set(
+                            f"세부 주제 {len(plan)}개를 대분류 {len(set(plan.values()))}개로 묶었습니다. "
+                            "마음에 들지 않으면 끌어서 옮기거나 '대분류 풀기'를 누르세요.\n"
+                            + self.preview_summary(counts=False))
                 elif kind == "cancelled_scan":
                     self.preview_paths = None
                     self.status_var.set("검사가 중단되었습니다. 원본 파일은 그대로 있습니다.")
@@ -1203,7 +1236,7 @@ class OrganizerApp(tk.Tk):
                             messagebox.showerror("로컬 AI 준비", event[1])
                     else:
                         # 실행되면 바로 모델 확인으로 이어서, 없으면 받기를 묻는다.
-                        self.status_var.set("Ollama가 실행되었습니다. AI 모델을 확인하는 중입니다…")
+                        self.status_var.set("Ollama를 실행했습니다. AI 모델을 확인하는 중입니다…")
                         self.on_ai_toggle()
                 elif kind == "pulled":
                     self._set_busy(False)

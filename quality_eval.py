@@ -152,10 +152,10 @@ def evaluate(
     with output_file.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(("relative_path", "expected_folder", "suggested_folder",
-                         "suggested_subfolder", "reason", "method", "error"))
+                         "suggested_subfolder", "suggested_detail", "reason", "method", "error"))
         for relative, doc in sorted(by_relative.items()):
             writer.writerow((relative, expected_any.get(relative, ""), doc.folder,
-                             doc.subfolder, doc.folder_reason, doc.method, doc.error))
+                             doc.subfolder, doc.detail, doc.folder_reason, doc.method, doc.error))
     return scores
 
 
