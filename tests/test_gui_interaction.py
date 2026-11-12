@@ -131,6 +131,7 @@ class GuiInteractionTests(unittest.TestCase):
             return plan
 
         with mock.patch("app.add_top_level", side_effect=fake_group), \
+                mock.patch("app.ollama_unload") as unload, \
                 mock.patch("app.ollama_missing_models", return_value=[]):
             self.app.toggle_top_level()
             deadline = time.monotonic() + 10
@@ -138,8 +139,12 @@ class GuiInteractionTests(unittest.TestCase):
                 self.app.update()
                 time.sleep(0.05)
             self.app.update()
+            deadline = time.monotonic() + 5
+            while not unload.called and time.monotonic() < deadline:
+                time.sleep(0.02)
         tops = [self.table.item(row, "text") for row in self.table.get_children("")]
         self.assertEqual(tops, ["짝수 주제  (24개)", "홀수 주제  (24개)"])
+        unload.assert_called_once()  # 끝나면 모델을 메모리에서 내린다
         self.assertEqual(self.app.group_button.cget("text"), "대분류 풀기")
         self.assertIn("구조 점수", self.app.status_var.get())
         with mock.patch.object(messagebox, "askyesno", return_value=True):
@@ -187,7 +192,7 @@ class GuiInteractionTests(unittest.TestCase):
                 seen["enabled"] = enabled
                 return "AI 분류 0개."
 
-            with mock.patch("app.default_cache_path", return_value=Path(folder) / "cache.sqlite3"),                     mock.patch("app.ollama_missing_models", return_value=[]),                     mock.patch("app.ai_preview_note", side_effect=fake_preview),                     mock.patch("app.LocalCache.responses", autospec=True,
+            with mock.patch("app.default_cache_path", return_value=Path(folder) / "cache.sqlite3"),                     mock.patch("app.ollama_missing_models", return_value=[]),                     mock.patch("app.ollama_unload"),                     mock.patch("app.ai_preview_note", side_effect=fake_preview),                     mock.patch("app.LocalCache.responses", autospec=True,
                                side_effect=lambda cache, fresh=False: seen.setdefault("store_fresh", fresh) or {}):
                 self.assertEqual(self.app.fresh_button.cget("text"), "AI 분류 다시하기")
                 self.app.fresh_button.invoke()

@@ -20,7 +20,7 @@ from structure_score import structure_score
 from ai_hierarchy import FORMAT_FOLDERS as HIERARCHY_FORMAT_FOLDERS, MIN_TOPICS, add_top_level
 from ollama_setup import find_ollama, install_ollama, start_ollama, wait_until_running, winget_available
 from local_cache import LocalCache, cached_hierarchy, cached_ollama, clear_cache, default_cache_path
-from ai_groups import OLLAMA_DOWNLOAD, assign_ai_folders, ollama_missing_models, ollama_pull
+from ai_groups import OLLAMA_DOWNLOAD, assign_ai_folders, ollama_missing_models, ollama_pull, ollama_unload
 from organizer import Document, default_destination, move_documents, reassign_documents, rename_document, rename_detail, rename_folder, rename_subfolder, route, scan, source_files, undo_jobs, undo_report, valid_folder_name, ResultReport
 from reader import SUPPORTED, find_tesseract, ocr_status
 
@@ -614,6 +614,8 @@ class OrganizerApp(tk.Tk):
                 self.events.put(("grouped", documents, snapshot, plan, ""))
             except (OSError, RuntimeError, ValueError) as exc:
                 self.events.put(("grouped", None, snapshot, {}, f"대분류를 만들지 못했습니다: {exc}"))
+            finally:
+                ollama_unload()
 
         threading.Thread(target=work, daemon=False).start()
 
@@ -683,6 +685,9 @@ class OrganizerApp(tk.Tk):
                 self.events.put(("cancelled_scan",))
             except Exception as exc:
                 self.events.put(("error", str(exc)))
+            finally:
+                if use_ai:
+                    ollama_unload()
 
         threading.Thread(target=work, daemon=False).start()
 
