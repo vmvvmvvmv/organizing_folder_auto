@@ -185,5 +185,58 @@ class EmbeddingGroupTests(unittest.TestCase):
         )
         self.assertEqual(count, 1)
         self.assertEqual(doc.folder, "Invoices")
+
+
+class CenteredClusterTests(unittest.TestCase):
+    """문서들이 공통 성분을 크게 공유해도 주제별로 묶이는지 본다."""
+
+    def vectors(self):
+        import random
+        rng = random.Random(3)
+        shared = [rng.gauss(0, 1) for _ in range(64)]          # 분야·서식 공통 성분
+        topics = [[rng.gauss(0, 1) for _ in range(64)] for _ in range(3)]
+        from ai_groups import _unit
+        return [_unit([3 * s + t + rng.gauss(0, 0.2) for s, t in zip(shared, topics[index % 3])])
+                for index in range(15)]
+
+    def test_shared_component_does_not_hide_topics(self):
+        from ai_groups import _cluster, _greedy_cluster
+        vectors = self.vectors()
+        expected = [[i for i in range(15) if i % 3 == topic] for topic in range(3)]
+        self.assertEqual(sorted(_cluster(vectors)), expected)
+        self.assertNotEqual(sorted(_greedy_cluster(vectors)), expected)  # 예전 방식은 한 덩어리로 묶는다
+
+    def test_split_folders_of_one_topic_are_joined(self):
+        from ai_groups import _centered, _similar_folder_merges
+        centered = _centered(self.vectors())
+        names = ["가", "가", "가", "나", "나", "나", "다", "다", "다", "가2", "나", "다", "가", "나", "다"]
+        proposals = [(document(f"root/{i}.pdf"), names[i], "") for i in range(15)]
+        centered_of = {doc.source: vector for (doc, _, _), vector in zip(proposals, centered)}
+        self.assertEqual(_similar_folder_merges(proposals, centered_of, set(), 0.2), {"가2": "가"})
+
+    def test_temporary_server_error_is_retried(self):
+        import ai_groups
+        calls = []
+
+        def once(*_args):
+            calls.append(1)
+            if len(calls) < 3:
+                raise ai_groups._ServerError("HTTP 500")
+            return {"ok": True}
+
+        with mock.patch("ai_groups._ollama_once", side_effect=once), mock.patch("ai_groups.time.sleep"):
+            self.assertEqual(ai_groups._ollama_request("/api/chat", "m", {}, 5), {"ok": True})
+        self.assertEqual(len(calls), 3)
+
+    def test_gentle_mode_uses_fewer_threads_and_rests(self):
+        import ai_groups
+        seen = []
+        with mock.patch("ai_groups._ollama_once", side_effect=lambda e, m, body, t: seen.append(body) or {}),                 mock.patch("ai_groups.time.sleep") as rest, mock.patch.object(ai_groups, "GENTLE", True):
+            ai_groups._ollama_request("/api/chat", "m", {"options": {"temperature": 0}}, 5)
+        self.assertEqual(seen[0]["options"]["temperature"], 0)
+        self.assertGreaterEqual(seen[0]["options"]["num_thread"], 1)
+        rest.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

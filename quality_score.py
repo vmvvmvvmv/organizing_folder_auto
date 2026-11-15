@@ -29,9 +29,9 @@ class QualityCheck:
     warnings: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
-        head = (f"분류 점검: 미분류 {self.unclassified:.0%} · 사진 묶음 {self.images_unsorted:.0%} · "
+        head = (f"점검 · 미분류 {self.unclassified:.0%} · 사진 묶음 {self.images_unsorted:.0%} · "
                 f"작은 폴더 {self.small_folders:.0%} · 근거 약함 {self.no_evidence:.0%}")
-        return head + (" — 확인해 보세요: " + "; ".join(self.warnings) if self.warnings else " — 눈에 띄는 문제 없음")
+        return head + (" — 확인: " + "; ".join(self.warnings) if self.warnings else " — 이상 없음")
 
 
 def _has_evidence(doc: Document) -> bool:
@@ -54,11 +54,11 @@ def quality_check(documents: list[Document]) -> QualityCheck:
     no_evidence = sum(not _has_evidence(doc) for doc in topical) / len(topical) if topical else 0.0
     warnings = []
     if unclassified > 0.2:
-        warnings.append("미분류가 많습니다(영어 문서·스캔본·글자 없는 파일일 수 있음)")
+        warnings.append("미분류 많음 (영어·스캔·글자 없는 파일?)")
     if images > 0.3:
-        warnings.append("사진이 많아 내용별로 나누지 못하고 한 폴더에 모았습니다")
+        warnings.append("사진 많음 · 한 폴더에 모음")
     if small > 0.4:
-        warnings.append("파일 1~2개짜리 폴더가 많습니다. 비슷한 폴더를 끌어다 합쳐 보세요")
+        warnings.append("작은 폴더 많음 · 끌어서 합치기")
     if no_evidence > 0.3:
-        warnings.append("폴더 이름이 파일 내용과 잘 맞지 않는 파일이 많습니다")
+        warnings.append("이름·내용 불일치 많음")
     return QualityCheck(unclassified, images, small, no_evidence, warnings)

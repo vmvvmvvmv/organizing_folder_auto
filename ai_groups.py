@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import copy
+from array import array
 from collections import Counter
 import http.client
 import json
+import time
 import math
 import os
 import re
@@ -22,6 +24,14 @@ BATCH_SIZE = 8
 LABEL_BATCH_SIZE = 4
 MAX_TEXT = 600
 SIMILARITY = 0.54
+# 평균을 뺀 벡터의 평균 연결 군집 기준과 적용 범위(문서 수)
+CLUSTER_SIMILARITY = 0.25
+CENTER_MIN = 12
+CLUSTER_LIMIT = 600
+FOLDER_MERGE_SIMILARITY = 0.2
+# 문서가 CLUSTER_LIMIT를 넘는 큰 폴더는 폴더 수가 많아 잘못 합칠 여지가 커서 기준을 높인다.
+# 실제 자료 819개: 0.25에서 F1 0.822 → 0.833(검증용 0.341 → 0.392), 0.2에서는 0.757로 떨어졌다.
+LARGE_FOLDER_MERGE_SIMILARITY = 0.25
 SMALL_FOLDER = 2
 # 재판정 요청에 함께 보내는 기존 폴더 수 상한. 폴더가 수백 개면 요청이 문맥 길이(4096)를 넘을 수 있다.
 # (속도 효과는 작았다: 90개→30개에서 요청당 5.8초→5.5초.)
@@ -76,7 +86,32 @@ RESPONSE_FORMAT = {
 }
 
 
+class _ServerError(RuntimeError):
+    """Ollama 쪽 일시 오류(HTTP 5xx). 메모리 부족 등은 잠시 뒤 다시 하면 되는 경우가 많다."""
+
+
+# '천천히 실행': Ollama가 쓰는 CPU 스레드를 줄이고 요청 사이에 쉬어 다른 작업에 자리를 내준다.
+GENTLE = False
+
+
 def _ollama_request(endpoint: str, model: str, body: dict, timeout: int) -> dict:
+    if GENTLE:
+        body = {**body, "options": {**body.get("options", {}), "num_thread": max(1, (os.cpu_count() or 4) // 4)}}
+    for attempt in range(3):
+        try:
+            started = time.monotonic()
+            result = _ollama_once(endpoint, model, body, timeout)
+            if GENTLE:
+                time.sleep(min(3.0, (time.monotonic() - started) / 2))  # 일한 시간의 절반만큼 쉰다.
+            return result
+        except _ServerError:
+            if attempt == 2:
+                raise
+            time.sleep(3 * (attempt + 1))
+    raise AssertionError("unreachable")
+
+
+def _ollama_once(endpoint: str, model: str, body: dict, timeout: int) -> dict:
     connection = http.client.HTTPConnection("127.0.0.1", 11434, timeout=timeout)
     try:
         connection.request(
@@ -95,7 +130,8 @@ def _ollama_request(endpoint: str, model: str, body: dict, timeout: int) -> dict
             if response.status == 400 and "context" in detail.lower() and "exceed" in detail.lower():
                 raise ContextSizeError("Ollama 문맥 크기를 초과했습니다")
             suffix = f": {detail[:160]}" if detail else ""
-            raise RuntimeError(f"Ollama 응답 오류: HTTP {response.status}{suffix}")
+            error = _ServerError if response.status >= 500 else RuntimeError
+            raise error(f"Ollama 응답 오류: HTTP {response.status}{suffix}")
         return json.loads(response.read())
     except (OSError, http.client.HTTPException) as exc:
         raise RuntimeError("Ollama에 연결할 수 없습니다. 설치·실행 상태를 확인하세요.") from exc
@@ -105,6 +141,16 @@ def _ollama_request(endpoint: str, model: str, body: dict, timeout: int) -> dict
 
 OLLAMA_DOWNLOAD = "https://ollama.com/download/windows"
 REQUIRED_MODELS = (EMBED_MODEL, MODEL)
+
+
+def ollama_unload() -> None:
+    """분류가 끝나면 모델을 메모리에서 바로 내린다(그냥 두면 Ollama가 몇 분간 약 4GB를 잡고 있다)."""
+    # 임베딩 모델을 먼저 내린다. 순서를 바꾸면 큰 모델을 내리는 동안 온 요청이 무시되어 임베딩 모델이 남았다.
+    for endpoint, model in (("/api/embed", EMBED_MODEL), ("/api/generate", MODEL)):
+        try:
+            _ollama_once(endpoint, model, {"keep_alive": 0}, 10)
+        except RuntimeError:
+            pass  # 내리지 못해도 Ollama가 나중에 스스로 내린다.
 
 
 def ollama_missing_models(timeout: float = 3) -> list[str]:
@@ -499,7 +545,115 @@ def _dot(left: list[float], right: list[float]) -> float:
     return sum(a * b for a, b in zip(left, right))
 
 
+def _centered(vectors: list[list[float]]) -> list[list[float]]:
+    """폴더 전체 평균을 뺀 단위 벡터. 문서들이 공유하는 분야·서식 성분을 지운다."""
+    mean = [sum(column) / len(vectors) for column in zip(*vectors)]
+    return [_unit([value - middle for value, middle in zip(vector, mean)]) for vector in vectors]
+
+
+def _average_link(vectors: list[list[float]], threshold: float) -> list[list[int]]:
+    """평균 연결 군집. 가장 비슷한 두 묶음을 합치기를 반복하고, 평균 유사도가 threshold 아래면 멈춘다.
+
+    묶음마다 가장 가까운 상대를 기억해 두어 합칠 때마다 표 전체를 훑지 않는다.
+    """
+    count = len(vectors)
+    link = [array("d", bytes(8 * count)) for _ in range(count)]
+    for a in range(count):
+        row, vector = link[a], vectors[a]
+        for b in range(a):
+            row[b] = link[b][a] = _dot(vector, vectors[b])
+        row[a] = -2.0
+    active = list(range(count))
+    size = [1] * count
+    members = [[index] for index in range(count)]
+
+    def nearest(a: int) -> tuple[float, int]:
+        row = link[a]
+        return max((row[b], -b) for b in active if b != a)
+
+    best = [nearest(a) if count > 1 else (-2.0, 0) for a in range(count)]
+    while len(active) > 1:
+        score, negative, a = max((best[a][0], best[a][1], a) for a in active)
+        if score < threshold:
+            break
+        keep, gone = min(a, -negative), max(a, -negative)
+        weight_keep, weight_gone = size[keep], size[gone]
+        total = weight_keep + weight_gone
+        row_keep, row_gone = link[keep], link[gone]
+        active.remove(gone)
+        for other in active:
+            if other != keep:
+                row_keep[other] = link[other][keep] = (
+                    row_keep[other] * weight_keep + row_gone[other] * weight_gone) / total
+        size[keep] = total
+        members[keep].extend(members[gone])
+        members[gone] = []
+        if len(active) > 1:
+            for other in active:
+                if other == keep or -best[other][1] in (keep, gone):
+                    best[other] = nearest(other)
+    return [sorted(members[index]) for index in active]
+
+
+def _similar_folder_merges(
+    proposals: list[tuple[Document, str, str]],
+    centered_of: dict[Path, list[float]],
+    protected: set[str],
+    threshold: float,
+) -> dict[str, str]:
+    """같은 주제가 여러 이름으로 갈라진 폴더를 평균 연결 유사도로 합친다. {없어질 이름: 남을 이름}.
+
+    NCS 시험 폴더 8개에서 기준 0.2일 때 F1 0.594 → 0.639, 가상 사용자 4명은 0.693 → 0.691.
+    0.15부터는 서로 다른 주제가 합쳐졌다(회사원 0.95 → 0.79).
+    """
+    members: dict[str, list[Path]] = {}
+    for doc, folder, _ in proposals:
+        if (folder != "미분류" and folder.replace(" ", "").casefold() not in protected
+                and doc.source in centered_of):
+            members.setdefault(folder, []).append(doc.source)
+    names = sorted(members)
+    if len(names) < 2:
+        return {}
+    # 두 폴더의 문서 쌍 평균 유사도는 폴더 평균 벡터의 내적과 같다.
+    means = [[sum(column) / len(members[name]) for column in zip(*(centered_of[source] for source in members[name]))]
+             for name in names]
+    counts = [len(members[name]) for name in names]
+    renamed: dict[str, str] = {}
+    # 평균 벡터를 점으로 보고 묶되, 폴더 크기를 반영하려면 합칠 때마다 가중 평균으로 갱신한다.
+    link = {(a, b): _dot(means[a], means[b]) for a in range(len(names)) for b in range(a)}
+    alive = set(range(len(names)))
+    while link:
+        (a, b), score = max(link.items(), key=lambda item: (item[1], item[0]))
+        if score < threshold:
+            break
+        keep, gone = (a, b) if (counts[a], -a) >= (counts[b], -b) else (b, a)
+        alive.discard(gone)
+        for other in alive:
+            if other != keep:
+                pair_keep, pair_gone = (max(keep, other), min(keep, other)), (max(gone, other), min(gone, other))
+                link[pair_keep] = (link[pair_keep] * counts[keep] + link.pop(pair_gone) * counts[gone]) / (
+                    counts[keep] + counts[gone])
+        del link[(a, b)]
+        counts[keep] += counts[gone]
+        renamed = {old: (names[keep] if new == names[gone] else new) for old, new in renamed.items()}
+        renamed[names[gone]] = names[keep]
+    return renamed
+
+
 def _cluster(vectors: list[list[float]]) -> list[list[int]]:
+    """폴더 전체의 공통 성분을 뺀 벡터로 평균 연결 군집을 만든다.
+
+    한 폴더의 문서는 분야·서식이 비슷해 서로 다른 주제도 유사도가 높게 나온다. 전체 평균을 빼면
+    주제 차이만 남는다(NCS 시험 폴더: 같은 주제 중앙값 0.22, 다른 주제 90% 지점 0.09).
+    """
+    count = len(vectors)
+    if not CENTER_MIN <= count <= CLUSTER_LIMIT:
+        # 큰 폴더는 예전 방식이 낫다. 실제 자료 819개에서 이 방식은 서로 다른 주제를 섞었다(F1 0.82 → 0.72).
+        return _greedy_cluster(vectors)
+    return _average_link(_centered(vectors), CLUSTER_SIMILARITY)
+
+
+def _greedy_cluster(vectors: list[list[float]]) -> list[list[int]]:
     """가장 가까운 묶음에 넣되, 묶음 안 문서와도 충분히 비슷해야 합친다."""
     groups: list[list[int]] = []
     centers: list[list[float]] = []
@@ -700,6 +854,8 @@ def assign_ai_folders(
             progress(start, total)
     vectors = [_unit(vector) for vector in vectors]
     vector_of = {doc.source: vector for doc, vector in zip(eligible, vectors)}
+    centered_of = (dict(zip((doc.source for doc in eligible), _centered(vectors)))
+                   if len(vectors) >= CENTER_MIN else {})
     name_vectors: dict[str, list[float] | None] = {}
 
     def meaning_evidence(name: str, doc: Document) -> bool:
@@ -715,6 +871,7 @@ def assign_ai_folders(
         return vector is not None and _dot(vector, vector_of[doc.source]) >= MEANING_SIMILARITY
     if vectors and any(len(vector) != len(vectors[0]) for vector in vectors):
         raise ValueError("Ollama 임베딩 차원이 서로 다릅니다")
+    stage("비슷한 문서 묶기")
     groups = _cluster(vectors)
     proposals: list[tuple[Document, str, str]] = []
     labelled_groups: list[tuple[list[int], str]] = []
@@ -854,6 +1011,7 @@ def assign_ai_folders(
                       for name in {*TYPE_FOLDERS.values(), "GIS 자료", "버전 관리 설정"}}
         # 서로 무관한 문서를 한 요청에 묶으면 모델이 id를 바꿔 답하는 일이 있어 한 건씩 묻는다.
         stage("미분류 문서 다시 보기")
+        retry_failures = 0
         for done, position in enumerate(retry):
             if should_cancel and should_cancel():
                 raise InterruptedError("AI 분류가 중단되었습니다")
@@ -872,6 +1030,12 @@ def assign_ai_folders(
             try:
                 answers = classify(items, topics)
             except (ContextSizeError, IncompleteResultError):
+                continue
+            except RuntimeError:
+                # 다시 보기는 덤이다. Ollama가 메모리 부족 등으로 한 번 실패해도 지금까지의 분류를 버리지 않는다.
+                retry_failures += 1
+                if retry_failures >= 3:
+                    break
                 continue
             if len(answers) != len(positions):
                 continue
@@ -923,6 +1087,17 @@ def assign_ai_folders(
                 for doc, folder, reason in proposals
             ]
             labelled_groups = [(group, renamed.get(name, name)) for group, name in labelled_groups]
+        joined = _similar_folder_merges(
+            proposals, centered_of, type_names,
+            FOLDER_MERGE_SIMILARITY if len(vectors) <= CLUSTER_LIMIT else LARGE_FOLDER_MERGE_SIMILARITY,
+        ) if centered_of else {}
+        if joined:
+            proposals = [
+                (doc, joined[folder], f"{reason} · 비슷한 폴더 통합: {folder}")
+                if folder in joined else (doc, folder, reason)
+                for doc, folder, reason in proposals
+            ]
+            labelled_groups = [(group, joined.get(name, name)) for group, name in labelled_groups]
     stage("하위 폴더 나누기")
     subfolders = _subfolder_suggestions(eligible, labelled_groups, subdivide, should_cancel, root, progress)
     if should_cancel and should_cancel():

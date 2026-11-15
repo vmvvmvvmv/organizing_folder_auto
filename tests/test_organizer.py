@@ -833,5 +833,113 @@ class OrganizerTests(unittest.TestCase):
         self.assertIn("미리보기 이후", errors[0][1])
 
 
+
+
+class PreviewFileTests(unittest.TestCase):
+    def test_preview_round_trip_keeps_routes_and_digests(self):
+        import tempfile
+        from organizer import load_preview, save_preview
+        docs = [Document(Path("C:/원본/a.pdf"), "업무", "AI 분류: 이유", "PDF 텍스트", lead_text="본문",
+                         preview_digest=b"\x01\x02", subfolder="출장", detail="독일", output_name="a (2).pdf"),
+                Document(Path("C:/원본/b.pdf"), "미분류", "", "PDF 텍스트", duplicate_of=Path("C:/원본/a.pdf"))]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "미리보기.json"
+            save_preview(path, Path("C:/원본"), Path("C:/결과"), docs, {"scan_note": "AI 분류 2개"})
+            source, destination, loaded, extra = load_preview(path)
+        self.assertEqual((source, destination, extra), (Path("C:/원본"), Path("C:/결과"), {"scan_note": "AI 분류 2개"}))
+        self.assertEqual(loaded, docs)
+
+    def test_broken_preview_file_is_reported(self):
+        import tempfile
+        from organizer import load_preview
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "x.json"
+            path.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "다른 버전"):
+                load_preview(path)
+
+
+class CopyModeTests(unittest.TestCase):
+    def test_copy_keeps_originals_and_undo_removes_only_copies(self):
+        import tempfile
+        from organizer import ResultReport, move_documents, scan, undo_report
+        with tempfile.TemporaryDirectory() as folder:
+            source, destination = Path(folder) / "source", Path(folder) / "result"
+            source.mkdir()
+            destination.mkdir()
+            (source / "보고서.txt").write_text("출장 결과", encoding="utf-8")
+            (source / "보고서 사본.txt").write_text("출장 결과", encoding="utf-8")   # 같은 내용
+            (source / "회의.txt").write_text("회의 내용", encoding="utf-8")
+            documents = scan(source, destination, None)
+            for doc in documents:
+                doc.folder = "업무"
+            with ResultReport(source, destination, documents) as report:
+                copied, skipped, errors = move_documents(documents, destination, source_root=source,
+                                                         record=report.record, keep_originals=True)
+            self.assertEqual((len(copied), len(skipped), errors), (2, 1, []))
+            self.assertEqual(sorted(p.name for p in source.iterdir()), ["보고서 사본.txt", "보고서.txt", "회의.txt"])
+            self.assertEqual(len(list((destination / "업무").iterdir())), 2)
+            self.assertIn("복사", report.path.read_text(encoding="utf-8-sig"))
+            restored, failed = undo_report(report.path)
+            self.assertEqual((len(restored), failed), (2, []))
+            self.assertFalse((destination / "업무").exists())              # 사본만 지우고 빈 폴더 정리
+            self.assertEqual(len(list(source.iterdir())), 3)               # 원본은 그대로
+
+    def test_undo_keeps_copy_when_original_changed(self):
+        import tempfile
+        from organizer import ResultReport, move_documents, scan, undo_report
+        with tempfile.TemporaryDirectory() as folder:
+            source, destination = Path(folder) / "source", Path(folder) / "result"
+            source.mkdir()
+            destination.mkdir()
+            (source / "메모.txt").write_text("처음", encoding="utf-8")
+            documents = scan(source, destination, None)
+            documents[0].folder = "자료"
+            with ResultReport(source, destination, documents) as report:
+                move_documents(documents, destination, source_root=source, record=report.record, keep_originals=True)
+            (source / "메모.txt").write_text("나중에 고침", encoding="utf-8")
+            restored, failed = undo_report(report.path)
+            self.assertEqual(restored, [])
+            self.assertIn("사본을 남겼습니다", failed[0][1])
+            self.assertTrue((destination / "자료" / "메모.txt").exists())
+
+
+
+class SpaceTests(unittest.TestCase):
+    def test_copy_counts_every_unique_file_and_move_only_the_largest(self):
+        import tempfile
+        from collections import namedtuple
+        from organizer import space_needed
+        usage = namedtuple("usage", "total used free")
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for name, size in (("a.bin", 300), ("b.bin", 500)):
+                (root / name).write_bytes(b"x" * size)
+            docs = [Document(root / "a.bin", "자료", "", "", preview_digest=b"a"),
+                    Document(root / "b.bin", "자료", "", "", preview_digest=b"b"),
+                    Document(root / "b.bin", "자료", "", "", preview_digest=b"b"),        # 같은 내용
+                    Document(root / "c.bin", "자료", "", "", duplicate_of=root / "a.bin")]
+            margin = 200 * 1024 * 1024
+            with mock.patch("organizer.shutil.disk_usage", return_value=usage(0, 0, margin + 600)):
+                self.assertEqual(space_needed(docs, root / "결과", keep_originals=True), (200, margin + 600))
+                self.assertEqual(space_needed(docs, root / "결과", keep_originals=False)[0], 0)
+
+
+
+class ExcludeTests(unittest.TestCase):
+    def test_excluded_folders_and_patterns_are_left_alone(self):
+        import tempfile
+        import organizer
+        from organizer import source_files
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "source"
+            for rel in ("보고서.pdf", "개인/일기.txt", "업무/~$임시.docx", "업무/회의.tmp", "업무/회의록.docx"):
+                (source / rel).parent.mkdir(parents=True, exist_ok=True)
+                (source / rel).write_text("x", encoding="utf-8")
+            with mock.patch.object(organizer, "EXCLUDE", ["개인", "~$*", "*.TMP"]):
+                files = source_files(source, Path(folder) / "result")[0]
+        self.assertEqual(sorted(p.name for p in files), ["보고서.pdf", "회의록.docx"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -241,7 +241,7 @@ class HierarchyTests(unittest.TestCase):
             stage=stages.append,
         )
         # 단계마다 이름을 알려, 오래 걸리는 단계에서도 화면이 멈춘 것처럼 보이지 않게 한다.
-        self.assertEqual(stages, ["문서 내용 비교(임베딩)", "묶음 이름 짓기", "하위 폴더 나누기"])
+        self.assertEqual(stages, ["문서 내용 비교(임베딩)", "비슷한 문서 묶기", "묶음 이름 짓기", "하위 폴더 나누기"])
         self.assertIn(("문서 내용 비교(임베딩)", 8, 8), updates)
         self.assertIn(("묶음 이름 짓기", 8, 8), updates)
         self.assertTrue(all(0 <= current <= total for _, current, total in updates))

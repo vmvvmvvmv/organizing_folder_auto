@@ -138,6 +138,8 @@ def cached_hierarchy(store: MutableMapping) -> dict[str, Callable]:
         "taxonomy": lambda folders, low, high, parent="": cached(
             "taxonomy", ai_hierarchy.ollama_taxonomy, folders, low, high, parent),
         "pick": lambda folders, categories: cached("pick", ai_hierarchy.ollama_pick, folders, categories),
+        "user_pick": lambda folders, categories: cached(
+            "user_pick " + ai_hierarchy.USER_PICK_INSTRUCTIONS, ai_hierarchy.ollama_user_pick, folders, categories),
         "embed": lambda texts: cached("embed", ai_groups.ollama_embeddings, texts),
     }
 

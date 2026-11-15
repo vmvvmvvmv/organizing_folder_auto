@@ -64,17 +64,31 @@ class PreviewLayoutTests(unittest.TestCase):
         self.assertEqual(drop_folder_row(table, rows, "sub:0:1"), "sub:0:1")
         self.assertIsNone(drop_folder_row(table, rows, ""))
 
+    def test_search_matches_file_name_or_folder_path(self):
+        docs = [Document(Path("root/독일 출장 보고서.pdf"), "출장", "", "PDF 텍스트"),
+                Document(Path("root/회의록.pdf"), "업무", "", "PDF 텍스트", subfolder="출장 회의"),
+                Document(Path("root/영수증.pdf"), "회계", "", "PDF 텍스트")]
+        self.assertEqual(group_preview_documents(docs, "전체", "출장"),
+                         {("출장",): [0], ("업무", "출장 회의"): [1]})
+        self.assertEqual(group_preview_documents(docs, "전체", "독일출장"), {("출장",): [0]})  # 띄어쓰기 무시
+        self.assertEqual(group_preview_documents(docs, "전체", "없는말"), {})
+
     def test_drag_highlights_hovered_file_and_containing_folder(self):
         surface = mock.Mock()
         surface.drag_target = None
         surface.drag_hover = None
         surface.folder_rows = {"folder:0": ("출장",)}
         OrganizerApp._show_drag_target(surface, "folder:0", "file:2")
-        surface.table.item.assert_any_call("folder:0", tags=("folder", "drop_target"))
+        surface.table.item.assert_any_call("folder:0", tags=("folder1", "drop_target"))
         surface.table.item.assert_any_call("file:2", tags=("drop_target",))
         OrganizerApp._show_drag_target(surface, None)
-        surface.table.item.assert_any_call("folder:0", tags=("folder",))
+        surface.table.item.assert_any_call("folder:0", tags=("folder1",))
         surface.table.item.assert_any_call("file:2", tags=())
+
+    def test_folder_rows_are_colored_by_depth(self):
+        from app import folder_tag
+        self.assertEqual([folder_tag(p) for p in (("가",), ("가", "나"), ("가", "나", "다"))],
+                         ["folder1", "folder2", "folder3"])
 
     def test_double_click_name_edits_and_other_columns_preview(self):
         for item in ("file:1", "folder:0", "sub:0:0"):

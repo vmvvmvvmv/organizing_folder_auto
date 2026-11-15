@@ -134,5 +134,70 @@ class HierarchyTests(unittest.TestCase):
         self.assertEqual(enum, ["요금제", "취업", OTHER])
 
 
+class UserFolderTests(unittest.TestCase):
+    def docs(self):
+        from pathlib import Path
+        from organizer import Document
+        names = [("부가세 신고", "세금"), ("종합소득세 신고", "세금"), ("원천세 신고", "세금"),
+                 ("3월 급여", "급여"), ("면접 일정", "채용"), ("여행 사진 설명", "미분류")]
+        return [Document(Path(f"root/{name}.pdf"), topic, "AI 분류: 이유", "PDF 텍스트", lead_text=name)
+                for name, topic in names]
+
+    def test_folder_counts_skip_unclassified_and_format_folders(self):
+        from ai_hierarchy import folder_counts
+        routes = [("세금", "")] * 3 + [("채용", "면접")] * 2 + [("미분류", ""), ("GIS 자료", "")]
+        counts = folder_counts(routes)
+        self.assertEqual(counts.most_common(), [("세금", 3), ("채용", 2), ("채용/면접", 2)])
+
+    def test_tree_and_target_list_round_trip(self):
+        from folder_editor import targets_to_tree, tree_to_targets
+        tree = targets_to_tree(["회계/세금", "인사", "회계/급여", "회계/세금"])
+        self.assertEqual(tree, [("회계", ["세금", "급여"]), ("인사", [])])
+        self.assertEqual(tree_to_targets(tree), ["회계/세금", "회계/급여", "인사"])
+
+    def test_cut_off_category_names_lose_unclosed_parenthesis(self):
+        from ai_hierarchy import _clean_categories
+        self.assertEqual(_clean_categories(["교육·학습 자료들 (학", "인사·급여 (채용)", " 영업 성과 "], set()),
+                         ["교육·학습 자료들", "인사·급여 (채용)", "영업 성과"])
+
+    def test_parse_lines(self):
+        from ai_hierarchy import parse_user_folders
+        good, bad = parse_user_folders("회계\n 회계 / 세금 \n인사\채용\n\n회계\n../밖\n미분류\na/b/c")
+        self.assertEqual(good, ["회계", "회계/세금", "인사/채용"])
+        self.assertEqual(bad, ["../밖", "미분류", "a/b/c"])
+
+    def test_topics_move_under_picked_user_folder(self):
+        from ai_hierarchy import fit_user_folders
+        docs = self.docs()
+        seen = []
+
+        def pick(items, categories):
+            seen.append([item["folder"] for item in items])
+            answers = {"급여": "회계", "채용": "인사"}
+            return [next((v for k, v in answers.items() if k in item["folder"]), "기타") for item in items]
+
+        fit_user_folders(docs, ["회계/세금", "회계", "인사"], pick)
+        self.assertNotIn("세금", seen[0])           # 이름이 같은 주제는 묻지 않고 바로 넣는다
+        routes = [(d.folder, d.subfolder, d.detail) for d in docs]
+        self.assertEqual(routes[:3], [("회계", "세금", "")] * 3)  # 주제 이름이 하위 폴더와 같으면 한 단계 줄임
+        self.assertEqual(routes[3], ("회계", "", ""))            # 파일 1개짜리 주제는 하위 폴더를 만들지 않음
+        self.assertEqual(routes[4], ("인사", "", ""))
+        self.assertEqual(routes[5], ("미분류", "", ""))          # 미분류 파일도 물었지만 맞는 곳 없음
+
+    def test_big_topic_becomes_subfolder_of_user_folder(self):
+        from pathlib import Path
+        from ai_hierarchy import fit_user_folders
+        from organizer import Document
+        docs = [Document(Path(f"root/독일 출장 {i}.pdf"), "독일 출장", "", "PDF 텍스트") for i in range(3)]
+        fit_user_folders(docs, ["해외영업"], lambda items, cats: ["해외영업"] * len(items))
+        self.assertEqual({(d.folder, d.subfolder) for d in docs}, {("해외영업", "독일 출장")})
+
+    def test_allow_new_keeps_ai_topic_when_nothing_fits(self):
+        from ai_hierarchy import fit_user_folders
+        docs = self.docs()
+        fit_user_folders(docs, ["인사"], lambda items, cats: ["기타"] * len(items), allow_new=True)
+        self.assertEqual([d.folder for d in docs][:3], ["세금"] * 3)
+
+
 if __name__ == "__main__":
     unittest.main()
