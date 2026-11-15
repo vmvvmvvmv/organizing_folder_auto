@@ -43,10 +43,10 @@ CONFIRM_BEFORE_OPEN = {
 
 def move_confirmation_text(documents: list[Document], copy: bool = False) -> str:
     if copy:
-        return f"{len(documents)}개 파일 복사?\n· 원본: 그대로 유지"
+        return f"파일 {len(documents)}개를 결과 폴더로 복사하시겠습니까?\n원본 파일은 그대로 남습니다."
     return (
-        f"{len(documents)}개 파일 이동?\n"
-        "· 이동한 원본 · 중복 원본: 삭제"
+        f"파일 {len(documents)}개를 결과 폴더로 옮기시겠습니까?\n"
+        "옮긴 파일과 내용이 같은 중복 파일은 원래 자리에서 지워집니다."
     )
 
 
@@ -130,7 +130,11 @@ class OrganizerApp(tk.Tk):
 
         self._build_menu()
         style = ttk.Style(self)
-        style.configure("Primary.TButton", font=("TkDefaultFont", 9, "bold"))
+        # 굵은 글씨도 기본 글꼴에서 만든다("TkDefaultFont"를 글꼴 이름으로 쓰면 다른 글꼴로 바뀐다).
+        # Tcl에 바로 만든다. tkfont.Font 객체는 정리될 때 글꼴을 지우고, 작업 스레드에서 정리되면 Tcl이 죽는다.
+        self.tk.call("font", "create", "AppBold", *self.tk.call("font", "actual", "TkDefaultFont"))
+        self.tk.call("font", "configure", "AppBold", "-weight", "bold")
+        self.option_add("*Text.font", "TkDefaultFont")
         style.configure("Status.TFrame", relief="sunken")
 
         # 아래 상태 표시줄을 먼저 붙여야 창을 줄여도 가려지지 않는다.
@@ -159,7 +163,7 @@ class OrganizerApp(tk.Tk):
 
         toolbar = ttk.Frame(frame, padding=(0, px(6)))
         toolbar.grid(row=1, column=0, sticky="ew")
-        self.scan_button = ttk.Button(toolbar, text="① 미리보기", command=self.start_scan)
+        self.scan_button = ttk.Button(toolbar, text="1. 미리보기", command=self.start_scan)
         self.scan_button.pack(side="left")
         # 읽은 본문·OCR은 저장된 것을 쓰고, 로컬 AI 분류만 처음부터 다시 받는다.
         self.fresh_button = ttk.Button(toolbar, text="AI에게 새로 묻기", command=lambda: self.start_scan(fresh_ai=True))
@@ -169,7 +173,7 @@ class OrganizerApp(tk.Tk):
         self.folders_button.pack(side="left", padx=(px(4), 0))
         self.cancel_button = ttk.Button(toolbar, text="중단", command=self.cancel_current, state="disabled")
         self.cancel_button.pack(side="left", padx=(px(12), 0))
-        self.move_button = ttk.Button(toolbar, text="③ 파일 정리 실행", style="Primary.TButton",
+        self.move_button = ttk.Button(toolbar, text="3. 파일 정리 실행",
                                       command=self.start_move, state="disabled")
         self.move_button.pack(side="right")
         self.open_button = ttk.Button(toolbar, text="결과 폴더 열기", command=self.open_result, state="disabled")
@@ -234,9 +238,9 @@ class OrganizerApp(tk.Tk):
         self.empty_hint = ttk.Label(
             table_frame, justify="center", foreground="#777", background="white",
             text="먼저 위 '원본' 칸에 정리할 폴더를 고르세요 (Ctrl+O)\n\n"
-                 "① 미리보기 (F5) — 파일은 아직 움직이지 않습니다\n\n"
-                 "② 폴더 구조 정하기 — 원하는 폴더 이름이 있을 때만\n\n"
-                 "③ 파일 정리 실행 — 목록을 확인·수정한 뒤")
+                 "1. 미리보기 (F5) — 파일은 아직 움직이지 않습니다\n\n"
+                 "2. 폴더 구조 정하기 — 원하는 폴더 이름이 있을 때만\n\n"
+                 "3. 파일 정리 실행 — 목록을 확인·수정한 뒤")
         self.table_scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.table.yview)
         self.table_scrollbar.grid(row=1, column=1, sticky="ns")
         self.table.configure(yscrollcommand=self._on_table_yview)
@@ -286,9 +290,9 @@ class OrganizerApp(tk.Tk):
         for name in FILTERS:
             self.menus["보기"].add_radiobutton(label=f"표시: {name}", variable=self.filter_var, value=name,
                                               command=self.refresh_table)
-        menu("도구", [("① 미리보기", self.start_scan, "F5"),
+        menu("도구", [("1. 미리보기", self.start_scan, "F5"),
                      ("AI에게 새로 묻기", lambda: self.start_scan(fresh_ai=True), "Shift+F5"),
-                     ("③ 파일 정리 실행", self.start_move), ("중단", self.cancel_current, "Esc"),
+                     ("3. 파일 정리 실행", self.start_move), ("중단", self.cancel_current, "Esc"),
                      None, ("check", "AI 사용", self.ai_var, self.on_ai_toggle),
                      ("check", "원본 유지 (복사)", self.copy_var),
                      None, ("설정…", self.open_settings)])
@@ -335,7 +339,7 @@ class OrganizerApp(tk.Tk):
         if self.busy:
             return
         if not path.is_file():
-            messagebox.showinfo("미리보기 불러오기", "저장된 미리보기 없음")
+            messagebox.showinfo("미리보기 불러오기", "저장된 미리보기가 없습니다.")
             return
         try:
             source, destination, documents, extra = load_preview(path)
@@ -343,7 +347,7 @@ class OrganizerApp(tk.Tk):
             messagebox.showerror("미리보기 불러오기", str(exc))
             return
         if not source.is_dir():
-            messagebox.showerror("미리보기 불러오기", f"원본 폴더 없음: {source}")
+            messagebox.showerror("미리보기 불러오기", f"원본 폴더를 찾을 수 없습니다.\n{source}")
             return
         self.source_var.set(str(source))
         self.destination_var.set(str(destination))
@@ -396,7 +400,7 @@ class OrganizerApp(tk.Tk):
     def show_about(self) -> None:
         messagebox.showinfo(
             "정보", f"문서 OCR 정리 {APP_VERSION}\n\n"
-                   "PC 안에서만 읽고 분류합니다(문서가 인터넷으로 나가지 않음).\n"
+                   "문서는 이 PC 안에서만 읽고 분류합니다. 인터넷으로 나가지 않습니다.\n"
                    "OCR: Tesseract · 로컬 AI: Ollama\n\n라이선스: AGPL-3.0")
 
     def choose_source(self) -> None:
@@ -507,15 +511,15 @@ class OrganizerApp(tk.Tk):
         source = Path(self.source_var.get().strip())
         destination = Path(self.destination_var.get().strip())
         if not self.source_var.get().strip() or not source.is_dir():
-            messagebox.showerror("폴더 확인", "존재하는 원본 폴더를 선택하세요")
+            messagebox.showerror("폴더 확인", "원본 폴더를 선택해 주세요.")
             return None
         if not self.destination_var.get().strip():
-            messagebox.showerror("폴더 확인", "결과 폴더를 선택하세요")
+            messagebox.showerror("폴더 확인", "결과 폴더를 선택해 주세요.")
             return None
         source = source.resolve()
         destination = destination.resolve()
         if source == destination or source.is_relative_to(destination):
-            messagebox.showerror("폴더 확인", "결과 폴더는 원본 폴더와 별도로 지정하세요")
+            messagebox.showerror("폴더 확인", "결과 폴더는 원본 폴더와 다른 곳으로 지정해 주세요.")
             return None
         return source, destination
 
@@ -533,11 +537,11 @@ class OrganizerApp(tk.Tk):
         else:
             self.progress.stop()
             self.progress.pack_forget()
-        for menu, label in (("도구", "① 미리보기"), ("도구", "AI에게 새로 묻기"), ("파일", "정리 되돌리기…"),
+        for menu, label in (("도구", "1. 미리보기"), ("도구", "AI에게 새로 묻기"), ("파일", "정리 되돌리기…"),
                             ("편집", FOLDERS_LABEL + "…"), ("도구", "설정…")):
             self._menu_state(menu, label, not busy)
         self.undo_button.configure(state="disabled" if busy else "normal")
-        self._menu_state("도구", "③ 파일 정리 실행", not busy and bool(self.documents) and self.preview_paths is not None)
+        self._menu_state("도구", "3. 파일 정리 실행", not busy and bool(self.documents) and self.preview_paths is not None)
         self._menu_state("도구", "중단", busy)
         self._menu_state("파일", "결과 폴더 열기", self.last_result_dir is not None)
 
@@ -554,7 +558,7 @@ class OrganizerApp(tk.Tk):
             return
         if not messagebox.askyesno(
             "작업 중 창 닫기",
-            "현재 파일(묶음)까지 처리 후 닫기\n· 옮긴 파일 · 기록: 유지\n닫을까요?",
+            "지금 처리 중인 파일까지만 마치고 닫습니다.\n이미 옮긴 파일과 기록은 그대로 남습니다.\n\n창을 닫으시겠습니까?",
         ):
             return
         self.close_requested = True
@@ -578,22 +582,22 @@ class OrganizerApp(tk.Tk):
         if error:
             if find_ollama() is not None:
                 if messagebox.askyesno(
-                    "로컬 AI 준비", "Ollama 꺼짐 · 실행할까요?",
+                    "로컬 AI 준비", "Ollama가 꺼져 있습니다. 실행하시겠습니까?",
                 ):
                     self.start_ollama_setup(install=False)
                     return
             elif winget_available():
                 if messagebox.askyesno(
                     "로컬 AI 준비",
-                    "Ollama 필요 (무료)\n\n"
-                    "winget 자동 설치?\n"
-                    "· 약 1GB · 인터넷\n· Ollama 사용 조건 동의",
+                    "AI 분류에는 Ollama(무료)가 필요합니다.\n\n"
+                    "winget으로 설치하시겠습니까?\n"
+                    "약 1GB를 인터넷에서 받으며, Ollama 사용 조건에 동의하게 됩니다.",
                 ):
                     self.start_ollama_setup(install=True)
                     return
             elif messagebox.askyesno(
                 "로컬 AI 준비",
-                f"{error}\n\nOllama 필요 (무료) · 설치·실행 후 다시 켜기\n\n다운로드 페이지 열까요?",
+                f"{error}\n\nAI 분류에는 Ollama(무료)가 필요합니다. 설치하고 실행한 뒤 'AI 사용'을 다시 켜 주세요.\n\n다운로드 페이지를 여시겠습니까?",
             ):
                 webbrowser.open(OLLAMA_DOWNLOAD)
             self.ai_var.set(False)
@@ -604,8 +608,8 @@ class OrganizerApp(tk.Tk):
             return
         if messagebox.askyesno(
             "로컬 AI 모델 받기",
-            f"AI 모델 없음: {', '.join(missing)}\n\n"
-            "· 최초 1회 · 약 3GB · 인터넷\n받을까요?",
+            f"AI 모델이 없습니다: {', '.join(missing)}\n\n"
+            "처음 한 번만 약 3GB를 인터넷에서 받습니다.\n지금 받으시겠습니까?",
         ):
             self.start_model_pull(missing)
         else:
@@ -673,8 +677,8 @@ class OrganizerApp(tk.Tk):
         path = default_cache_path()
         if not messagebox.askyesno(
             "기억 지우기",
-            f"읽은 내용·AI 답 기억을 지울까요?\n{path}\n"
-            "· 원본 파일은 그대로 · 다음 미리보기가 처음처럼 느려짐",
+            f"읽은 내용과 AI 답 기억을 지우시겠습니까?\n{path}\n\n"
+            "원본 파일은 그대로 남지만, 다음 미리보기는 처음처럼 오래 걸립니다.",
         ):
             return
         try:
@@ -720,7 +724,7 @@ class OrganizerApp(tk.Tk):
         return "\n".join(lines)
 
     def show_summary_detail(self) -> None:
-        messagebox.showinfo("분류 요약", getattr(self, "summary_detail", "") or "아직 미리보기 전")
+        messagebox.showinfo("분류 요약", getattr(self, "summary_detail", "") or "아직 미리보기를 하지 않았습니다.")
 
     def toggle_top_level(self) -> None:
         """세부 주제 폴더를 AI가 만든 대분류 아래로 묶거나, 묶기 전으로 되돌린다."""
@@ -728,7 +732,7 @@ class OrganizerApp(tk.Tk):
             return
         if self.grouped_snapshot is not None:
             if not messagebox.askyesno(
-                "대분류 풀기", "묶기 전으로 복귀 (묶은 뒤 수정도 취소)\n풀까요?",
+                "대분류 풀기", "묶기 전으로 되돌립니다. 묶은 뒤에 고친 내용도 함께 취소됩니다.\n\n풀겠습니까?",
             ):
                 return
             for doc, (folder, subfolder, detail, reason) in zip(self.documents, self.grouped_snapshot):
@@ -743,7 +747,7 @@ class OrganizerApp(tk.Tk):
         if len(topics) < MIN_TOPICS:
             messagebox.showinfo(
                 "대분류로 묶기",
-                f"주제 폴더 {len(topics)}개 · 이미 한눈에 보임\n{MIN_TOPICS}개 이상부터 묶기")
+                f"주제 폴더가 {len(topics)}개라 이미 한눈에 보입니다.\n{MIN_TOPICS}개 이상일 때 묶을 수 있습니다.")
             return
         snapshot = [(doc.folder, doc.subfolder, doc.detail, doc.folder_reason) for doc in self.documents]
         fresh_ai = getattr(self, "fresh_ai_last", False)
@@ -912,7 +916,7 @@ class OrganizerApp(tk.Tk):
             self.drag_preview = preview
             self.drag_preview_label = tk.Label(
                 preview, padx=10, pady=6, relief="solid", borderwidth=1,
-                font=("Malgun Gothic", 10),
+                font="TkDefaultFont",
             )
             self.drag_preview_label.pack()
         if len(self.drag_indices) == 1:
@@ -1007,14 +1011,15 @@ class OrganizerApp(tk.Tk):
         return "break"
 
     def on_table_double_click(self, event: tk.Event) -> str | None:
-        """이름 칸은 이름 바꾸기, 나머지 칸은 파일을 기본 프로그램으로 연다(폴더는 들어갈 파일 목록)."""
+        """파일은 기본 프로그램으로 연다. 폴더는 이름 칸이면 이름 바꾸기, 나머지 칸이면 들어갈 파일 목록.
+        파일 이름 바꾸기는 F2·우클릭으로 한다."""
         if self.busy:
             return None
         item = self.table.identify_row(event.y)
         if not item:
             return None
         self.table.selection_set(item)
-        if self.table.identify_column(event.x) == "#0":
+        if item in self.folder_rows and self.table.identify_column(event.x) == "#0":
             if self.table.identify_element(event.x, event.y) == "Treeitem.indicator":
                 return None
             self.begin_rename(item)
@@ -1065,7 +1070,7 @@ class OrganizerApp(tk.Tk):
                 return
             doc = self.documents[indices[0]]
             if doc.duplicate_of is not None or doc.preserve_structure:
-                messagebox.showinfo("이름 바꾸기", "이름 변경 불가")
+                messagebox.showinfo("이름 바꾸기", "이 항목은 이름을 바꿀 수 없습니다.")
                 return
             current = Path(doc.output_name or doc.source.name).stem
         self.table.see(item)
@@ -1134,7 +1139,7 @@ class OrganizerApp(tk.Tk):
                     and route(doc)[depth - 1] != path[-1] and route(doc)[depth - 1].casefold() == key
                     for doc in self.documents)
                 if existing and not messagebox.askyesno(
-                    "폴더 합치기", f"'{name}' 폴더 있음 · 합칠까요?",
+                    "폴더 합치기", f"'{name}' 폴더가 이미 있습니다. 합치시겠습니까?",
                 ):
                     return "break"
                 if name != path[-1]:
@@ -1257,7 +1262,7 @@ class OrganizerApp(tk.Tk):
             return
         edited = self.manual_edit_count()
         if edited and not messagebox.askyesno(
-                "폴더 구조 정하기", f"직접 고친 파일 {edited}개가 AI 결과 기준으로 돌아갑니다.\n다시 맞출까요?"):
+                "폴더 구조 정하기", f"직접 고친 파일 {edited}개가 AI 결과대로 돌아갑니다.\n새 폴더 구조에 다시 맞추시겠습니까?"):
             self.status_var.set(f"지정 폴더 {len(self.user_folders)}개 저장 · 다음 미리보기부터 적용")
             return
         documents = copy.deepcopy(self.documents)
@@ -1342,24 +1347,24 @@ class OrganizerApp(tk.Tk):
 
     def show_selected_preview(self) -> None:
         if self.busy or not self.table.selection():
-            messagebox.showinfo("미리보기", "파일·폴더 선택 필요")
+            messagebox.showinfo("미리보기", "파일이나 폴더를 먼저 선택해 주세요.")
             return
         item = self.table.selection()[0]
         selected = preview_selection(self.documents, self.folder_rows, item)
         if not selected:
-            messagebox.showinfo("미리보기", "파일 없음")
+            messagebox.showinfo("미리보기", "파일이 없습니다.")
             return
         folder_row = self.folder_rows.get(item)
         if not folder_row:
             # 파일은 연결된 프로그램으로 바로 연다. 실행 파일 같은 형식만 먼저 묻는다.
             document = selected[0]
             if document.source.suffix.casefold() in CONFIRM_BEFORE_OPEN:
-                if not messagebox.askyesno("파일 열기", f"{document.source.name}\n실행 파일 · 열까요?"):
+                if not messagebox.askyesno("파일 열기", f"{document.source.name}\n\n실행 파일입니다. 여시겠습니까?"):
                     return
             try:
                 os.startfile(document.source)
             except OSError as exc:
-                messagebox.showerror("파일 열기", f"열기 실패: {exc}")
+                messagebox.showerror("파일 열기", f"파일을 열지 못했습니다.\n{exc}")
             return
         window = tk.Toplevel(self)
         window.title("폴더 미리보기")
@@ -1372,7 +1377,7 @@ class OrganizerApp(tk.Tk):
         header = ttk.Frame(outer)
         header.pack(fill="x", pady=(0, 8))
         title = " / ".join(part for part in folder_row if part)
-        ttk.Label(header, text=title, font=("Malgun Gothic", 12, "bold")).pack(side="left")
+        ttk.Label(header, text=title, font="AppBold").pack(side="left")
         content = ttk.Frame(outer)
         content.pack(fill="both", expand=True)
         body = tk.Text(content, wrap="word", padx=10, pady=10)
@@ -1403,15 +1408,15 @@ class OrganizerApp(tk.Tk):
         try:
             jobs = undo_jobs(report)
         except (OSError, ValueError, KeyError) as exc:
-            messagebox.showerror("정리 되돌리기", f"기록 읽기 실패: {exc}")
+            messagebox.showerror("정리 되돌리기", f"기록 파일을 읽지 못했습니다.\n{exc}")
             return
         if not jobs:
-            messagebox.showinfo("정리 되돌리기", "되돌릴 파일 없음")
+            messagebox.showinfo("정리 되돌리기", "되돌릴 파일이 없습니다.")
             return
         if not messagebox.askyesno(
             "정리 되돌리기",
-            f"{len(jobs)}개 파일 되돌리기?\n"
-            "· 원래 위치에 같은 이름 새 파일: 건너뜀",
+            f"파일 {len(jobs)}개를 원래 자리로 되돌리시겠습니까?\n"
+            "원래 자리에 같은 이름의 새 파일이 있으면 그 파일은 건너뜁니다.",
         ):
             return
         self.cancel_event.clear()
@@ -1441,7 +1446,7 @@ class OrganizerApp(tk.Tk):
 
         # 미리보기와 다른 폴더를 정리하면 화면에 보인 분류가 틀어질 수 있다.
         if self.preview_paths != paths:
-            messagebox.showerror("미리보기 확인", "폴더 변경됨 · 미리보기 다시")
+            messagebox.showerror("미리보기 확인", "미리보기 뒤에 폴더가 바뀌었습니다. 미리보기를 다시 해 주세요.")
             return
         copy_mode = self.copy_var.get()
         try:
@@ -1449,8 +1454,8 @@ class OrganizerApp(tk.Tk):
         except OSError:
             short, free = 0, 0  # 공간을 못 재면 막지 않는다. 옮기다 실패하면 파일마다 실패로 남는다.
         if short:
-            messagebox.showerror("공간 부족", f"결과 폴더 드라이브 공간 부족\n· 남은 공간 {size_text(free)}\n"
-                                              f"· 더 필요 {size_text(short)}\n다른 드라이브를 고르거나 공간을 비우세요")
+            messagebox.showerror("공간 부족", f"결과 폴더가 있는 드라이브에 공간이 부족합니다.\n남은 공간: {size_text(free)}\n"
+                                              f"더 필요한 공간: {size_text(short)}\n\n다른 드라이브를 고르거나 공간을 비워 주세요.")
             return
         if not messagebox.askyesno("복사 확인" if copy_mode else "이동 확인",
                                    move_confirmation_text(self.documents, copy_mode)):
@@ -1512,7 +1517,7 @@ class OrganizerApp(tk.Tk):
                     elif not plan:
                         self.status_var.set("묶을 대분류 없음 · 그대로")
                         if not self.close_requested:
-                            messagebox.showinfo("대분류로 묶기", "묶을 대분류 없음 · 그대로")
+                            messagebox.showinfo("대분류로 묶기", "묶을 대분류가 없어 그대로 둡니다.")
                     else:
                         self.documents = grouped
                         self.grouped_snapshot = snapshot
@@ -1553,11 +1558,11 @@ class OrganizerApp(tk.Tk):
                         continue
                     if errors or unprocessed:
                         detail = "\n".join(f"{doc.source.name}: {error}" for doc, error in errors[:8])
-                        messagebox.showwarning("정리 결과", f"실패 {len(errors)} · 미처리 {unprocessed}\n남은 원본 확인 → 미리보기 다시\n{detail}")
+                        messagebox.showwarning("정리 결과", f"실패 {len(errors)}개, 처리하지 못한 파일 {unprocessed}개가 있습니다.\n남은 원본을 확인한 뒤 미리보기를 다시 해 주세요.\n\n{detail}")
                     else:
                         if messagebox.askyesno(
                                 "정리 결과",
-                                f"{verb} {len(moved)} · {dup} {len(deduplicated)}\n{destination}\n\n결과 폴더를 열까요?"):
+                                f"정리를 마쳤습니다.\n{verb} {len(moved)}개 · {dup} {len(deduplicated)}개\n{destination}\n\n결과 폴더를 여시겠습니까?"):
                             self.open_result()
                 elif kind == "ai_setup":
                     self._handle_ai_setup(event[1], event[2])
@@ -1599,10 +1604,10 @@ class OrganizerApp(tk.Tk):
                         detail = "\n".join(f"{path.name}: {error}" for path, error in errors[:8])
                         messagebox.showwarning(
                             "되돌리기 결과",
-                            f"복원 {len(restored)} · 실패 {len(errors)} · 미처리 {skipped}\n{detail}",
+                            f"복원 {len(restored)}개 · 실패 {len(errors)}개 · 처리 못 함 {skipped}개\n\n{detail}",
                         )
                     else:
-                        messagebox.showinfo("되돌리기 결과", f"복원 {len(restored)}개 완료")
+                        messagebox.showinfo("되돌리기 결과", f"파일 {len(restored)}개를 원래 자리로 되돌렸습니다.")
                 elif kind == "error":
                     self.status_var.set(event[1])
                     self.preview_paths = None

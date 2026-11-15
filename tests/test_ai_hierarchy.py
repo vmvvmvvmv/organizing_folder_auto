@@ -198,6 +198,23 @@ class UserFolderTests(unittest.TestCase):
         fit_user_folders(docs, ["인사"], lambda items, cats: ["기타"] * len(items), allow_new=True)
         self.assertEqual([d.folder for d in docs][:3], ["세금"] * 3)
 
+    def test_filename_naming_one_user_folder_wins_over_ai_topic(self):
+        from pathlib import Path
+        from ai_hierarchy import _named_target, fit_user_folders
+        from organizer import Document
+        targets = ["검수 문서", "회의록", "설문 조사", "메뉴와 레시피", "Invoices", "행정/출장 보고"]
+        self.assertEqual(_named_target("물품검수조서(명함)", targets), "검수 문서")
+        self.assertEqual(_named_target("출장 결과보고서 v2", targets), "행정/출장 보고")
+        self.assertEqual(_named_target("신메뉴 레시피 정리", targets), "메뉴와 레시피")
+        self.assertEqual(_named_target("invoice_2026_03", targets), "Invoices")
+        self.assertIsNone(_named_target("설문조사 회의록", targets))   # 두 폴더를 가리키면 AI 판단에 맡긴다
+        self.assertIsNone(_named_target("메뉴 사진", targets))        # 핵심 말이 다 있어야 한다
+        docs = [Document(Path(f"root/{name}.pdf"), "행정구역 개편", "", "PDF 텍스트")
+                for name in ("행정구역 개편 연구", "주간 회의록", "용역검수조서")]
+        fit_user_folders(docs, ["행정구역 개편", "회의록", "검수 문서"], lambda items, cats: ["기타"] * len(items))
+        self.assertEqual([d.folder for d in docs], ["행정구역 개편", "회의록", "검수 문서"])
+        self.assertIn("파일명이 '회의록'", docs[1].folder_reason)
+
 
 if __name__ == "__main__":
     unittest.main()

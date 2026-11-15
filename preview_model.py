@@ -64,7 +64,7 @@ def drop_folder_row(
 
 
 FOLDER_LEVEL_STYLES = (
-    ("#d6e4f5", ("TkDefaultFont", 9, "bold")),   # 대분류
+    ("#d6e4f5", "AppBold"),   # 대분류
     ("#e3f2e1", None),                            # 중분류
     ("#fbf3d9", None),                            # 소분류
 )

@@ -90,10 +90,22 @@ class PreviewLayoutTests(unittest.TestCase):
         self.assertEqual([folder_tag(p) for p in (("가",), ("가", "나"), ("가", "나", "다"))],
                          ["folder1", "folder2", "folder3"])
 
-    def test_double_click_name_edits_and_other_columns_preview(self):
-        for item in ("file:1", "folder:0", "sub:0:0"):
+    def test_double_click_file_opens_it(self):
+        for column in ("#0", "#1"):
             surface = mock.Mock()
             surface.busy = False
+            surface.folder_rows = {"folder:0": ("업무",)}
+            surface.table.identify_row.return_value = "file:1"
+            surface.table.identify_column.return_value = column
+            self.assertEqual(OrganizerApp.on_table_double_click(surface, mock.Mock(x=25, y=42)), "break")
+            surface.show_selected_preview.assert_called_once_with()
+            surface.begin_rename.assert_not_called()
+
+    def test_double_click_folder_name_edits_and_other_columns_preview(self):
+        for item in ("folder:0", "sub:0:0"):
+            surface = mock.Mock()
+            surface.busy = False
+            surface.folder_rows = {"folder:0": ("업무",), "sub:0:0": ("업무", "회의")}
             surface.table.identify_row.return_value = item
             surface.table.identify_column.return_value = "#0"
             surface.table.identify_element.return_value = ""

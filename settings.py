@@ -54,7 +54,7 @@ def save_user_folders(folders: list[str], allow_new: bool) -> None:
         pass  # 저장하지 못해도 이번 실행에서는 쓴다.
 
 
-FOLDERS_LABEL = "② 폴더 구조 정하기"
+FOLDERS_LABEL = "2. 폴더 구조 정하기"
 
 
 def user_folders_label(folders: list[str]) -> str:

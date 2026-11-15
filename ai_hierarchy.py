@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections import Counter
 from collections.abc import Callable
 
@@ -240,6 +241,27 @@ def folder_counts(routes: list[tuple[str, str]]) -> Counter[str]:
     return counts
 
 
+NAME_FILLER = {"문서", "자료", "관리", "파일", "기타", "정리", "모음", "files", "documents"}
+
+
+def _name_terms(name: str) -> set[str]:
+    """폴더 이름의 핵심 말. '메뉴와 레시피' → {메뉴, 레시피}, 'Invoices' → {invoice}."""
+    terms = set()
+    for term in re.findall(r"[가-힣]{2,}|[a-z]{3,}", name.casefold()):
+        term = re.sub(r"(와|과)$", "", term) if re.match(r"[가-힣]", term) else re.sub(r"(?<=.{3})s$", "", term)
+        if len(term) >= 2 and term not in NAME_FILLER:
+            terms.add(term)
+    return terms
+
+
+def _named_target(stem: str, targets: list[str]) -> str | None:
+    """파일명에 지정 폴더(맨 끝 이름)의 핵심 말이 모두 들어 있는 폴더가 딱 하나면 그 폴더."""
+    compact = re.sub(r"[^가-힣a-z]", "", stem.casefold())
+    hits = [target for target in targets
+            if (terms := _name_terms(target.split("/")[-1])) and all(term in compact for term in terms)]
+    return hits[0] if len(hits) == 1 else None
+
+
 def fit_user_folders(
     documents: list[Document],
     targets: list[str],
@@ -298,6 +320,15 @@ def fit_user_folders(
     for key, doc in loose.items():
         if plan.get(key):
             place(doc, plan[key], "")
+    # 파일명이 지정 폴더 하나를 분명히 가리키면 AI 묶음보다 앞선다('물품검수조서' → '검수 문서').
+    # 주제로 나누는 사람에게는 영향이 없도록, 사용자가 정한 이름에 맞을 때만 쓴다.
+    for doc in originals:
+        target = _named_target(doc.source.stem, targets)
+        if target and not doc.error:
+            folder, _, sub = target.partition("/")
+            if (doc.folder, doc.subfolder if sub else "") != (folder, sub):
+                doc.folder_reason = f"파일명이 '{target}'을 가리킴"
+                place(doc, target, "")
     # 중복 파일은 원본을 따라간다.
     route_of = {doc.source: (doc.folder, doc.subfolder, doc.detail) for doc in originals}
     for doc in documents:

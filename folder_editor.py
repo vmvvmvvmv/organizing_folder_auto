@@ -12,7 +12,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from organizer import valid_folder_name
 
-HELP = "더블클릭: 이름 바꾸기 · 우클릭: 더 많은 기능 · Ctrl/Shift로 여러 개 선택"
+HELP = "더블클릭: 이름 바꾸기 · 우클릭: 더 많은 기능 · Ctrl/Shift: 여러 개 선택"
 
 
 # 처음 시작할 때 고를 수 있는 폴더 틀. 업무 기능 기준(기록관리 원칙)으로, 한 단계 10개 이내.
@@ -178,9 +178,9 @@ class FolderEditor(tk.Toplevel):
                 return None
             name = " ".join(name.split())
             if not valid_folder_name(name) or "/" in name or name in {"미분류", "기타"}:
-                messagebox.showerror(title, "사용 불가 이름", parent=self)
+                messagebox.showerror(title, "폴더 이름으로 쓸 수 없는 이름입니다.", parent=self)
             elif name in taken:
-                messagebox.showerror(title, f"'{name}' 이미 있음", parent=self)
+                messagebox.showerror(title, f"'{name}' 폴더가 이미 있습니다.", parent=self)
             else:
                 return name
 
@@ -261,7 +261,7 @@ class FolderEditor(tk.Toplevel):
             return
         nested = sum(len(self.tree.get_children(item)) for item in selected)
         if (len(selected) > 1 or nested) and not messagebox.askyesno(
-                "선택 삭제", f"폴더 {len(selected)}개" + (f" (하위 {nested}개 포함)" if nested else "") + " 삭제?",
+                "선택 삭제", f"폴더 {len(selected)}개" + (f"(하위 폴더 {nested}개 포함)" if nested else "") + "를 삭제하시겠습니까?",
                 parent=self):
             return
         self.tree.delete(*selected)
@@ -283,7 +283,7 @@ class FolderEditor(tk.Toplevel):
         if not name:
             return
         if not valid_folder_name(name) or "/" in name:
-            messagebox.showerror("묶기", "사용 불가 이름", parent=self)
+            messagebox.showerror("묶기", "폴더 이름으로 쓸 수 없는 이름입니다.", parent=self)
             return
         parent = existing.get(name)
         if parent in selected:
@@ -359,23 +359,23 @@ class FolderEditor(tk.Toplevel):
             root = Path(name)
         tree = folder_structure(root)
         if not tree:
-            messagebox.showinfo("폴더 구조 불러오기", "하위 폴더 없음", parent=self)
+            messagebox.showinfo("폴더 구조 불러오기", "이 폴더에는 하위 폴더가 없습니다.", parent=self)
             return
         if self.tree.get_children() and not messagebox.askyesno(
-                "폴더 구조 불러오기", f"지금 목록을 '{root.name}'의 폴더 {len(tree)}개로 바꿀까요?", parent=self):
+                "폴더 구조 불러오기", f"지금 목록을 '{root.name}'의 폴더 {len(tree)}개로 바꾸시겠습니까?", parent=self):
             return
         self.fill(tree)
         self.status.configure(text=f"'{root.name}' 구조 · 고친 뒤 저장")
 
     def load_template(self, name: str) -> None:
         if self.tree.get_children() and not messagebox.askyesno(
-                "템플릿", f"지금 목록을 '{name}' 템플릿으로 바꿀까요?", parent=self):
+                "템플릿", f"지금 목록을 '{name}' 템플릿으로 바꾸시겠습니까?", parent=self):
             return
         self.fill(targets_to_tree(TEMPLATES[name]))
         self.status.configure(text=f"'{name}' 템플릿 · 고친 뒤 저장")
 
     def load_suggestions(self) -> None:
-        if self.tree.get_children() and not messagebox.askyesno("AI 제안 불러오기", "지금 목록을 AI 제안으로 바꿀까요?",
+        if self.tree.get_children() and not messagebox.askyesno("AI 제안 불러오기", "지금 목록을 AI가 만든 폴더로 바꾸시겠습니까?",
                                                                 parent=self):
             return
         self.fill([(name, []) for name in self.suggestions])
@@ -383,7 +383,7 @@ class FolderEditor(tk.Toplevel):
     def clear(self) -> None:
         """전체 삭제. 저장하면 지정 폴더 없이 자동 분류로 돌아간다."""
         if self.tree.get_children() and messagebox.askyesno(
-                "전체 삭제", f"폴더 {len(tree_to_targets(self.current()))}개 모두 삭제?\n(저장하면 자동 분류)",
+                "전체 삭제", f"폴더 {len(tree_to_targets(self.current()))}개를 모두 삭제하시겠습니까?\n빈 목록으로 저장하면 AI가 알아서 분류합니다.",
                 parent=self):
             self.fill([])
 

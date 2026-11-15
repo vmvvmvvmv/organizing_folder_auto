@@ -117,7 +117,7 @@ class GuiInteractionTests(unittest.TestCase):
                     self.app.update()
                     time.sleep(0.05)
                 self.app.update()
-            self.assertIn("1개 파일", ask.call_args.args[1])
+            self.assertIn("파일 1개", ask.call_args.args[1])
             done.assert_called_once()
             self.assertEqual((source / "a" / "메모.xyz").read_bytes(), b"memo")
             self.assertIn("1개 복원", self.app.status_var.get())
@@ -262,13 +262,13 @@ class GuiInteractionTests(unittest.TestCase):
         tree.selection_set((work, school))
         with mock.patch("folder_editor.messagebox.askyesno", return_value=False) as ask:
             editor.delete()                                      # 여러 개는 개수를 보여 주고 묻는다
-        self.assertIn("폴더 2개 (하위 2개 포함)", ask.call_args.args[1])
+        self.assertIn("폴더 2개(하위 폴더 2개 포함)", ask.call_args.args[1])
         self.assertEqual(len(editor.current()), 2)               # 취소하면 그대로
         editor.select_all()
         self.assertEqual(set(tree.selection()), set(tree.get_children()))
         with mock.patch("folder_editor.messagebox.askyesno", return_value=True) as ask:
             editor.clear()
-        self.assertIn("폴더 3개 모두 삭제", ask.call_args.args[1])  # 업무/출장, 업무/회의, 학교
+        self.assertIn("폴더 3개를 모두 삭제", ask.call_args.args[1])  # 업무/출장, 업무/회의, 학교
         self.assertEqual(editor.current(), [])
         self.assertEqual(str(editor.buttons["전체 삭제"].cget("state")), "disabled")
 
@@ -415,7 +415,7 @@ class GuiInteractionTests(unittest.TestCase):
     def test_toolbar_shows_steps_and_undo_and_settings_window(self):
         labels = [self.app.scan_button.cget("text"), self.app.folders_button.cget("text"),
                   self.app.move_button.cget("text")]
-        self.assertEqual([label[0] for label in labels], ["①", "②", "③"])
+        self.assertEqual([label[:2] for label in labels], ["1.", "2.", "3."])
         self.assertTrue(self.app.undo_button.winfo_ismapped())            # 정리 되돌리기는 늘 보인다
         self.app.open_settings()
         window = self.app.winfo_children()[-1]

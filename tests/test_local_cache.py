@@ -108,8 +108,8 @@ class LocalCacheTests(unittest.TestCase):
             self.assertEqual(settings.load_user_folders(), ([], False))
             settings.save_user_folders(["회계/세금", "인사"], True)
             self.assertEqual(settings.load_user_folders(), (["회계/세금", "인사"], True))
-        self.assertEqual(settings.user_folders_label([]), "② 폴더 구조 정하기 (선택)")
-        self.assertEqual(settings.user_folders_label(["a", "b"]), "② 폴더 구조 정하기 (2)")
+        self.assertEqual(settings.user_folders_label([]), "2. 폴더 구조 정하기 (선택)")
+        self.assertEqual(settings.user_folders_label(["a", "b"]), "2. 폴더 구조 정하기 (2)")
 
 
 if __name__ == "__main__":
