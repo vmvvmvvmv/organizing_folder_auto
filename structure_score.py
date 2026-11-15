@@ -34,7 +34,7 @@ class StructureScore:
 
     def summary(self) -> str:
         worst = sorted(self.parts.items(), key=lambda item: item[1])[:2]
-        return f"구조 점수 {self.score}점 · 약한 항목: " + ", ".join(f"{name} {value:.0%}" for name, value in worst)
+        return f"구조 점수 {self.score}점 · 약점: " + ", ".join(f"{name} {value:.0%}" for name, value in worst)
 
 
 def _count_score(count: int, good: int, bad: int) -> float:

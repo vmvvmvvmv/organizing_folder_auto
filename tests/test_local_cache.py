@@ -6,7 +6,7 @@ from unittest import mock
 
 import ai_groups
 import organizer
-from app import progress_text
+from progress import progress_text
 from local_cache import LocalCache, cached_ollama, clear_cache
 from organizer import move_documents, scan
 
@@ -83,10 +83,33 @@ class LocalCacheTests(unittest.TestCase):
         self.assertEqual(chat.call_count, 2)
 
     def test_progress_shows_remaining_time_after_a_few_seconds(self):
-        with mock.patch("app.time.monotonic", return_value=130.0):
-            self.assertEqual(progress_text("읽는 중", 100.0, 30, 90), "읽는 중: 30/90 · 남은 시간 약 1분")
-            self.assertEqual(progress_text("읽는 중", 129.0, 1, 90), "읽는 중: 1/90")
-            self.assertEqual(progress_text("읽는 중", 100.0, 90, 90), "읽는 중: 90/90")
+        with mock.patch("progress.time.monotonic", return_value=130.0):
+            self.assertEqual(progress_text("읽는 중", 100.0, 30, 90), "읽는 중 30/90 · 남은 1분")
+            self.assertEqual(progress_text("읽는 중", 129.0, 1, 90), "읽는 중 1/90")
+            self.assertEqual(progress_text("읽는 중", 100.0, 90, 90), "읽는 중 90/90")
+
+    def test_whole_estimate_follows_measured_speed_on_this_pc(self):
+        from progress import DEFAULT_AI_SECONDS, ai_seconds_per_document, remember_ai_speed, whole_text
+        self.assertEqual(ai_seconds_per_document(None), DEFAULT_AI_SECONDS)
+        with LocalCache(self.cache_path) as cache:
+            self.assertEqual(ai_seconds_per_document(cache), DEFAULT_AI_SECONDS)
+            remember_ai_speed(cache, 2.0, 100)      # 저장된 답으로 금방 끝난 실행은 기억하지 않는다
+            self.assertEqual(ai_seconds_per_document(cache), DEFAULT_AI_SECONDS)
+            remember_ai_speed(cache, 600.0, 100)    # 문서당 6초
+            self.assertEqual(ai_seconds_per_document(cache), 6.0)
+            remember_ai_speed(cache, 200.0, 100)    # 다음 실행과 평균
+            self.assertEqual(ai_seconds_per_document(cache), 4.0)
+        self.assertEqual(whole_text(600, 120), " · 전체 10분 중 2분 경과")
+        self.assertIn("초과", whole_text(600, 700))
+
+    def test_user_folders_are_saved_for_next_run(self):
+        import settings
+        with mock.patch("settings.default_cache_path", return_value=self.cache_path):
+            self.assertEqual(settings.load_user_folders(), ([], False))
+            settings.save_user_folders(["회계/세금", "인사"], True)
+            self.assertEqual(settings.load_user_folders(), (["회계/세금", "인사"], True))
+        self.assertEqual(settings.user_folders_label([]), "② 폴더 구조 정하기 (선택)")
+        self.assertEqual(settings.user_folders_label(["a", "b"]), "② 폴더 구조 정하기 (2)")
 
 
 if __name__ == "__main__":

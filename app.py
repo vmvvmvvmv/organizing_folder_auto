@@ -8,21 +8,32 @@ from collections.abc import Callable
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import contextlib
+import ai_groups
+import organizer
 import copy
 import webbrowser
 
 from quality_score import quality_check
 from structure_score import structure_score
-from ai_hierarchy import FORMAT_FOLDERS as HIERARCHY_FORMAT_FOLDERS, MIN_TOPICS, add_top_level
+from ai_hierarchy import (FORMAT_FOLDERS as HIERARCHY_FORMAT_FOLDERS, MIN_TOPICS, add_top_level,
+                          fit_user_folders, folder_counts, ollama_user_pick)
 from ollama_setup import find_ollama, install_ollama, start_ollama, wait_until_running, winget_available
+from folder_editor import FolderEditor
 from local_cache import LocalCache, cached_hierarchy, cached_ollama, clear_cache, default_cache_path
 from ai_groups import OLLAMA_DOWNLOAD, assign_ai_folders, ollama_missing_models, ollama_pull, ollama_unload
-from organizer import Document, default_destination, move_documents, reassign_documents, rename_document, rename_detail, rename_folder, rename_subfolder, route, scan, source_files, undo_jobs, undo_report, valid_folder_name, ResultReport
+from organizer import load_preview, save_preview, space_needed
+from organizer import Document, default_destination, move_documents, reassign_documents, rename_document, rename_detail, rename_folder, rename_subfolder, route, scan, source_files, undo_jobs, undo_report, ResultReport
 from reader import SUPPORTED, find_tesseract, ocr_status
+from progress import _duration, ai_seconds_per_document, progress_reporter, remember_ai_speed, size_text
+from preview_model import (FILTERS, FOLDER_LEVEL_STYLES, drop_folder_row, folder_tag, group_preview_documents,
+                           in_folder, preview_location, preview_selection, row_tags, selected_file_indices)
+from settings import (FOLDERS_LABEL, last_preview_path, load_excludes, load_user_folders, save_excludes, save_user_folders,
+                      user_folders_label)
 
 CONFIRM_BEFORE_OPEN = {
     ".exe", ".com", ".scr", ".msi", ".msp", ".bat", ".cmd", ".ps1",
@@ -30,12 +41,13 @@ CONFIRM_BEFORE_OPEN = {
 }
 
 
-def move_confirmation_text(documents: list[Document]) -> str:
+def move_confirmation_text(documents: list[Document], copy: bool = False) -> str:
+    if copy:
+        return f"{len(documents)}개 파일 복사?\n· 원본: 그대로 유지"
     return (
-        f"{len(documents)}개 파일을 결과 폴더로 이동할까요?\n"
-        "이동한 원본과 확인된 중복 원본은 삭제됩니다."
+        f"{len(documents)}개 파일 이동?\n"
+        "· 이동한 원본 · 중복 원본: 삭제"
     )
-
 
 
 def ai_preview_note(
@@ -51,101 +63,26 @@ def ai_preview_note(
         return ""
     count = assign_ai_folders(documents, progress=progress, should_cancel=should_cancel, ai_only=True,
                               source_root=source_root, stage=stage, **(calls or {}))
-    return f"AI 분류 {count}개."
+    return f"AI 분류 {count}개"
 
 
-def _duration(seconds: float) -> str:
-    if seconds < 60:
-        return f"{max(1, round(seconds))}초"
-    if seconds < 3600:
-        return f"{round(seconds / 60)}분"
-    return f"{int(seconds // 3600)}시간 {round(seconds % 3600 / 60)}분"
+UNDO_LIMIT = 50
 
 
-def progress_text(label: str, started: float, done: int, total: int) -> str:
-    """진행 수와 지금까지 속도로 계산한 남은 시간을 보여준다."""
-    text = f"{label}: {done}/{total}"
-    elapsed = time.monotonic() - started
-    if 0 < done < total and elapsed >= 3:
-        text += f" · 남은 시간 약 {_duration(elapsed / done * (total - done))}"
-    return text
-
-
-class progress_reporter:
-    """진행 수와 남은 시간을 화면에 알린다. stage()로 단계가 바뀌면 이름과 시간 계산을 새로 시작한다."""
-
-    def __init__(self, events: queue.Queue, label: str) -> None:
-        self.events, self.label, self.started = events, label, time.monotonic()
-
-    def stage(self, label: str) -> None:
-        self.label, self.started = label, time.monotonic()
-        self.events.put(("progress", f"{label}…"))
-
-    def __call__(self, done: int, total: int) -> None:
-        self.events.put(("progress", progress_text(self.label, self.started, done, total)))
-
-def group_preview_documents(documents: list[Document], mode: str) -> dict[tuple[str, ...], list[int]]:
-    """현재 필터의 파일을 폴더 경로((대분류,), (대분류, 중분류), (대분류, 중분류, 소분류))별로 묶는다."""
-    groups: dict[tuple[str, ...], list[int]] = {}
-    for index, doc in enumerate(documents):
-        visible = (
-            mode == "전체"
-            or (mode == "미분류" and doc.folder == "미분류")
-            or (mode == "읽기 실패" and bool(doc.error))
-            or (mode == "중복" and doc.duplicate_of is not None)
-            or (mode == "파일명 기준" and doc.source.suffix.lower() not in SUPPORTED)
-        )
-        if visible:
-            path = route(doc) if doc.folder else ("미분류",)
-            groups.setdefault(path, []).append(index)
-    return groups
-
-
-def preview_location(source_root: Path, source: Path) -> str:
-    """반복되는 전체 경로 대신 원본 폴더 아래 위치만 표시한다."""
-    try:
-        parent = source.parent.relative_to(source_root)
-    except ValueError:
-        return str(source.parent)
-    return "원본 폴더" if parent == Path(".") else str(parent)
-
-
-def selected_file_indices(items: tuple[str, ...]) -> list[int]:
-    """폴더 행을 파일 편집 대상으로 착각하지 않도록 구분한다."""
-    return [int(item[5:]) for item in items if item.startswith("file:") and item[5:].isdigit()]
-
-def drop_folder_row(
-    table: ttk.Treeview, folder_rows: dict[str, tuple[str, ...]], item: str,
-) -> str | None:
-    """폴더 안의 파일 행에 놓아도 가장 가까운 부모 폴더를 대상으로 삼는다."""
-    while item:
-        if item in folder_rows:
-            return item
-        item = table.parent(item)
-    return None
-
-
-def in_folder(doc: Document, path: tuple[str, ...]) -> bool:
-    """파일이 그 폴더 경로 안(아래 단계 포함)에 들어가는지."""
-    return route(doc)[:len(path)] == path
-
-
-def preview_selection(
-    documents: list[Document], folder_rows: dict[str, tuple[str, ...]], item: str,
-) -> list[Document]:
-    """선택한 파일 또는 제안 폴더에 들어갈 파일을 돌려준다."""
-    if item in folder_rows:
-        return [doc for doc in documents if in_folder(doc, folder_rows[item])]
-    indices = selected_file_indices((item,))
-    return [documents[indices[0]]] if indices and indices[0] < len(documents) else []
-
-
+APP_VERSION = "2026.11"
+HELP_URL = "https://github.com/vmvvmvvmv/organizing_folder_auto#사용-방법"
 class OrganizerApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("문서 OCR 정리")
-        self.geometry("1060x650")
-        self.minsize(780, 480)
+        # 화면 배율(125%·150% 등)에 맞춰 크기를 키운다. 배율 인식을 켜지 않은 실행에서는 1.0이다.
+        scale = self.winfo_fpixels("1i") / 96
+        self.px = px = lambda size: round(size * scale)
+        self.geometry(f"{px(1060)}x{px(650)}")
+        self.minsize(px(780), px(480))
+        # 행 높이를 글자 높이에 맞춘다(기본 20픽셀은 큰 배율에서 글자가 겹친다).
+        line = tkfont.nametofont("TkDefaultFont").metrics("linespace")
+        ttk.Style(self).configure("Treeview", rowheight=max(20, line + px(5)))
         self.documents: list[Document] = []
         self.folder_rows: dict[str, tuple[str, ...]] = {}
         self.drag_origin: tuple[int, int] | None = None
@@ -174,6 +111,7 @@ class OrganizerApp(tk.Tk):
         self.filter_var = tk.StringVar(value="전체")
         self.count_var = tk.StringVar(value="표시 0개")
         self.detail_var = tk.StringVar(value="")
+        self.search_var = tk.StringVar(value="")
         self.rename_entry: ttk.Entry | None = None
         self.rename_item: str | None = None
         self.context_item: str | None = None
@@ -181,80 +119,106 @@ class OrganizerApp(tk.Tk):
         # 대분류로 묶기 전의 (폴더, 하위 폴더, 분류 이유). 묶기를 풀 때 되돌린다.
         self.grouped_snapshot: list[tuple[str, str, str, str]] | None = None
         self.cache_var = tk.BooleanVar(value=True)
+        self.gentle_var = tk.BooleanVar(value=False)
+        # 복사 모드: 원본을 지우지 않는다. 옮기는 것이 불안한 사람을 위해 정리 시작 옆에 둔다.
+        self.copy_var = tk.BooleanVar(value=False)
+        # 폴더명 지정 창의 체크박스. 창마다 만들면 작업 스레드에서 정리되며 Tcl이 죽는다.
+        self.allow_new_var = tk.BooleanVar(value=False)
+        # 사용자가 미리 정한 폴더명. AI가 이 목록에 맞춰 넣는다. 다음 실행을 위해 이 PC에 저장한다.
+        self.user_folders, self.allow_new_folders = load_user_folders()
+        organizer.EXCLUDE[:] = load_excludes()
 
-        frame = ttk.Frame(self, padding=14)
+        self._build_menu()
+        style = ttk.Style(self)
+        style.configure("Primary.TButton", font=("TkDefaultFont", 9, "bold"))
+        style.configure("Status.TFrame", relief="sunken")
+
+        # 아래 상태 표시줄을 먼저 붙여야 창을 줄여도 가려지지 않는다.
+        status_bar = ttk.Frame(self, style="Status.TFrame", padding=(px(8), px(3)))
+        status_bar.pack(side="bottom", fill="x")
+        self.progress = ttk.Progressbar(status_bar, mode="indeterminate", length=px(140))
+        self.detail_button = ttk.Button(status_bar, text="자세히", width=6, state="disabled",
+                                        command=self.show_summary_detail)
+        self.detail_button.pack(side="right")
+        ttk.Label(status_bar, textvariable=self.status_var, anchor="w").pack(side="left", fill="x", expand=True)
+
+        frame = ttk.Frame(self, padding=(px(10), px(8), px(10), px(6)))
         frame.pack(fill="both", expand=True)
-        frame.columnconfigure(1, weight=1)
-        frame.rowconfigure(4, weight=1)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(2, weight=1)
 
-        ttk.Label(frame, text="원본 폴더").grid(row=0, column=0, sticky="w", pady=5)
-        ttk.Entry(frame, textvariable=self.source_var).grid(row=0, column=1, sticky="ew", padx=8)
-        ttk.Button(frame, text="선택", command=self.choose_source).grid(row=0, column=2)
+        paths = ttk.LabelFrame(frame, text="폴더", padding=(px(8), px(4)))
+        paths.grid(row=0, column=0, sticky="ew")
+        paths.columnconfigure(1, weight=1)
+        for row, (label, variable, command) in enumerate((
+                ("원본", self.source_var, self.choose_source),
+                ("결과", self.destination_var, self.choose_destination))):
+            ttk.Label(paths, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Entry(paths, textvariable=variable).grid(row=row, column=1, sticky="ew", padx=px(6), pady=2)
+            ttk.Button(paths, text="찾아보기…", command=command).grid(row=row, column=2, pady=2)
 
-        ttk.Label(frame, text="결과 폴더").grid(row=1, column=0, sticky="w", pady=5)
-        ttk.Entry(frame, textvariable=self.destination_var).grid(row=1, column=1, sticky="ew", padx=8)
-        ttk.Button(frame, text="선택", command=self.choose_destination).grid(row=1, column=2)
-
-        self.ai_checkbox = ttk.Checkbutton(frame, text="로컬 AI 분류 (규칙 검증 포함)", variable=self.ai_var,
-                                           command=self.on_ai_toggle)
-        self.ai_checkbox.grid(row=2, column=2, sticky="e")
-        cache_options = ttk.Frame(frame)
-        cache_options.grid(row=2, column=0, columnspan=2, sticky="w")
-        ttk.Checkbutton(cache_options, text="읽은 내용을 이 PC에 저장 (다시 볼 때 빠르게)",
-                        variable=self.cache_var).pack(side="left")
-        ttk.Button(cache_options, text="저장 내용 지우기", command=self.clear_saved_cache).pack(
-            side="left", padx=8)
-        scan_buttons = ttk.Frame(frame)
-        scan_buttons.grid(row=3, column=0, sticky="w", pady=8)
-        self.scan_button = ttk.Button(scan_buttons, text="분류 미리보기", command=self.start_scan)
+        toolbar = ttk.Frame(frame, padding=(0, px(6)))
+        toolbar.grid(row=1, column=0, sticky="ew")
+        self.scan_button = ttk.Button(toolbar, text="① 미리보기", command=self.start_scan)
         self.scan_button.pack(side="left")
         # 읽은 본문·OCR은 저장된 것을 쓰고, 로컬 AI 분류만 처음부터 다시 받는다.
-        self.fresh_button = ttk.Button(scan_buttons, text="AI 분류 다시하기",
-                                       command=lambda: self.start_scan(fresh_ai=True))
-        self.fresh_button.pack(side="left", padx=(6, 0))
-        self.cancel_button = ttk.Button(frame, text="중단", command=self.cancel_current, state="disabled")
-        self.cancel_button.grid(row=3, column=1, sticky="w", pady=8, padx=8)
-        result_buttons = ttk.Frame(frame)
-        result_buttons.grid(row=3, column=1, sticky="e", pady=8, padx=8)
-        self.undo_button = ttk.Button(result_buttons, text="정리 되돌리기…", command=self.start_undo)
-        self.undo_button.pack(side="left", padx=(0, 6))
-        self.open_button = ttk.Button(result_buttons, text="결과 폴더 열기", command=self.open_result, state="disabled")
-        self.open_button.pack(side="left")
-        self.move_button = ttk.Button(frame, text="정리 시작", command=self.start_move, state="disabled")
-        self.move_button.grid(row=3, column=2, sticky="e", pady=8)
+        self.fresh_button = ttk.Button(toolbar, text="AI에게 새로 묻기", command=lambda: self.start_scan(fresh_ai=True))
+        self.fresh_button.pack(side="left", padx=(px(4), 0))
+        self.folders_button = ttk.Button(toolbar, text=user_folders_label(self.user_folders),
+                                         command=self.edit_user_folders)
+        self.folders_button.pack(side="left", padx=(px(4), 0))
+        self.cancel_button = ttk.Button(toolbar, text="중단", command=self.cancel_current, state="disabled")
+        self.cancel_button.pack(side="left", padx=(px(12), 0))
+        self.move_button = ttk.Button(toolbar, text="③ 파일 정리 실행", style="Primary.TButton",
+                                      command=self.start_move, state="disabled")
+        self.move_button.pack(side="right")
+        self.open_button = ttk.Button(toolbar, text="결과 폴더 열기", command=self.open_result, state="disabled")
+        self.open_button.pack(side="right", padx=(0, px(4)))
+        # 정리를 되돌리는 안전장치는 메뉴에 숨기지 않는다.
+        self.undo_button = ttk.Button(toolbar, text="정리 되돌리기…", command=self.start_undo)
+        self.undo_button.pack(side="right", padx=(0, px(4)))
+        ttk.Checkbutton(toolbar, text="원본 유지 (복사)", variable=self.copy_var).pack(side="right", padx=(0, px(6)))
+        ttk.Separator(toolbar, orient="vertical").pack(side="right", fill="y", padx=px(8))
+        self.ai_checkbox = ttk.Checkbutton(toolbar, text="AI 사용", variable=self.ai_var, command=self.on_ai_toggle)
+        self.ai_checkbox.pack(side="right")
 
         table_frame = ttk.Frame(frame)
-        table_frame.grid(row=4, column=0, columnspan=3, sticky="nsew")
+        table_frame.grid(row=2, column=0, sticky="nsew")
         table_frame.columnconfigure(0, weight=1)
         table_frame.rowconfigure(1, weight=1)
         filters = ttk.Frame(table_frame)
-        filters.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 5))
+        filters.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, px(4)))
         ttk.Label(filters, text="표시").pack(side="left")
         filter_box = ttk.Combobox(
-            filters, textvariable=self.filter_var, state="readonly", width=12,
-            values=("전체", "미분류", "읽기 실패", "중복", "파일명 기준"),
+            filters, textvariable=self.filter_var, state="readonly", width=12, values=FILTERS,
         )
-        filter_box.pack(side="left", padx=6)
+        filter_box.pack(side="left", padx=px(6))
         filter_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh_table())
+        ttk.Label(filters, text="검색").pack(side="left", padx=(px(10), 0))
+        self.search_entry = ttk.Entry(filters, textvariable=self.search_var, width=22)
+        self.search_entry.pack(side="left", padx=px(6))
+        self.search_entry.bind("<KeyRelease>", lambda _event: self._schedule_search())
+        self.search_entry.bind("<Escape>", lambda _event: (self.search_var.set(""), self.refresh_table(), "break")[-1])
         ttk.Label(filters, textvariable=self.count_var).pack(side="left")
         ttk.Button(filters, text="모두 접기", command=lambda: self.set_all_folders_open(False)).pack(side="right")
-        ttk.Button(filters, text="보기", command=self.show_selected_preview).pack(side="right", padx=6)
+        ttk.Button(filters, text="모두 펼치기", command=lambda: self.set_all_folders_open(True)).pack(
+            side="right", padx=px(4))
+        ttk.Button(filters, text="파일 열기", command=self.show_selected_preview).pack(side="right", padx=px(4))
         self.group_button = ttk.Button(filters, text="대분류로 묶기", command=self.toggle_top_level,
                                        state="disabled")
-        self.group_button.pack(side="right", padx=6)
-        ttk.Button(filters, text="모두 펼치기", command=lambda: self.set_all_folders_open(True)).pack(
-            side="right", padx=6
-        )
+        # '대분류로 묶기'는 폴더명 지정 창의 'AI 묶기 제안'과 도구 메뉴로 옮겼다. 상태 관리용으로 위젯만 둔다.
         self.table = ttk.Treeview(
             table_frame, columns=("location", "method"), show="tree headings", selectmode="extended"
         )
         self.table.heading("#0", text="폴더 / 파일", command=lambda: self.sort_table("category"))
-        self.table.heading("location", text="원본 하위 폴더", command=lambda: self.sort_table("source"))
-        self.table.heading("method", text="읽기 방식", command=lambda: self.sort_table("method"))
-        self.table.column("#0", width=340, minwidth=190, stretch=True)
-        self.table.column("location", width=410, minwidth=160, stretch=True)
-        self.table.column("method", width=180, minwidth=130, stretch=False)
-        self.table.tag_configure("folder", background="#eaf1f8")
+        self.table.heading("location", text="원래 위치", command=lambda: self.sort_table("source"))
+        self.table.heading("method", text="상태", command=lambda: self.sort_table("method"))
+        self.table.column("#0", width=px(340), minwidth=px(190), stretch=True)
+        self.table.column("location", width=px(410), minwidth=px(160), stretch=True)
+        self.table.column("method", width=px(180), minwidth=px(130), stretch=False)
+        # 폴더 단계마다 색을 달리한다: 대분류(진한 파랑) → 중분류(연한 초록) → 소분류(연한 노랑).
+        for level, (background, font) in enumerate(FOLDER_LEVEL_STYLES, 1):
+            self.table.tag_configure(f"folder{level}", background=background, **({"font": font} if font else {}))
         self.table.tag_configure("drop_target", background="#cdebcf")
         self.table.grid(row=1, column=0, sticky="nsew")
         self.table.bind("<<TreeviewSelect>>", self.on_table_selection)
@@ -264,24 +228,176 @@ class OrganizerApp(tk.Tk):
         self.table.bind("<Double-1>", self.on_table_double_click)
         self.table.bind("<Button-3>", self.on_table_right_click)
         self.table.bind("<F2>", lambda _event: self.begin_rename_selected())
+        # 입력 칸(경로·검색·이름 바꾸기)에서는 Ctrl+Z가 글자 되돌리기여야 하므로 목록에만 건다.
+        self.table.bind("<Control-z>", lambda _event: self.undo_edit())
         self.table.bind("<Return>", lambda _event: self.show_selected_preview())
+        self.empty_hint = ttk.Label(
+            table_frame, justify="center", foreground="#777", background="white",
+            text="먼저 위 '원본' 칸에 정리할 폴더를 고르세요 (Ctrl+O)\n\n"
+                 "① 미리보기 (F5) — 파일은 아직 움직이지 않습니다\n\n"
+                 "② 폴더 구조 정하기 — 원하는 폴더 이름이 있을 때만\n\n"
+                 "③ 파일 정리 실행 — 목록을 확인·수정한 뒤")
         self.table_scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.table.yview)
         self.table_scrollbar.grid(row=1, column=1, sticky="ns")
         self.table.configure(yscrollcommand=self._on_table_yview)
         ttk.Label(
-            table_frame, textvariable=self.detail_var, wraplength=950, justify="left", anchor="w"
-        ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+            table_frame, textvariable=self.detail_var, wraplength=px(950), justify="left", anchor="w",
+            foreground="#555",
+        ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(px(4), 0))
         self.context_menu = tk.Menu(self, tearoff=0)
-        self.context_menu.add_command(label="이름 바꾸기", command=self.rename_context_item)
-        self.context_menu.add_command(label="보기 / 열기", command=self.preview_context_item)
+        self.context_menu.add_command(label="이름 바꾸기", accelerator="F2", command=self.rename_context_item)
+        self.context_menu.add_command(label="보기 / 열기", accelerator="Enter", command=self.preview_context_item)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="새 주제 폴더로 분류", command=self.create_folder_for_selection)
         self.context_menu.add_command(label="새 하위 폴더로 분류", command=self.create_subfolder_for_selection)
-        ttk.Label(frame, textvariable=self.status_var, wraplength=980).grid(
-            row=5, column=0, columnspan=3, sticky="w", pady=(5, 0)
-        )
         # 작업 스레드의 결과는 큐로 받아 화면 스레드에서 처리한다.
         self.after(100, self.poll_events)
+
+    def _build_menu(self) -> None:
+        """파일·편집·보기·도구·도움말 메뉴와 단축키."""
+        bar = tk.Menu(self)
+        self.configure(menu=bar)
+        self.menus: dict[str, tk.Menu] = {}
+
+        def menu(name: str, entries: list) -> None:
+            item = tk.Menu(bar, tearoff=0)
+            for entry in entries:
+                if entry is None:
+                    item.add_separator()
+                elif entry[0] == "check":
+                    item.add_checkbutton(label=entry[1], variable=entry[2], command=entry[3] if len(entry) > 3 else None)
+                else:
+                    label, command, key = (*entry, "")[:3]
+                    item.add_command(label=label, command=command, accelerator=key)
+            bar.add_cascade(label=name, menu=item)
+            self.menus[name] = item
+
+        menu("파일", [("원본 폴더 선택…", self.choose_source, "Ctrl+O"), ("결과 폴더 선택…", self.choose_destination),
+                     None, ("지난 미리보기 열기", lambda: self.open_preview(last_preview_path())),
+                     None, ("결과 폴더 열기", self.open_result), ("정리 되돌리기…", self.start_undo),
+                     None, ("끝내기", self.request_close, "Alt+F4")])
+        menu("편집", [("이름 바꾸기", self.begin_rename_selected, "F2"), ("파일 열기", self.show_selected_preview, "Enter"),
+                     ("검색", self.focus_search, "Ctrl+F"), ("수정 되돌리기", self.undo_edit, "Ctrl+Z"),
+                     None, ("새 폴더로 옮기기", self.create_folder_for_selection),
+                     ("새 하위 폴더로 옮기기", self.create_subfolder_for_selection),
+                     None, (FOLDERS_LABEL + "…", self.edit_user_folders, "Ctrl+L")])
+        menu("보기", [("모두 펼치기", lambda: self.set_all_folders_open(True)),
+                     ("모두 접기", lambda: self.set_all_folders_open(False)), None])
+        for name in FILTERS:
+            self.menus["보기"].add_radiobutton(label=f"표시: {name}", variable=self.filter_var, value=name,
+                                              command=self.refresh_table)
+        menu("도구", [("① 미리보기", self.start_scan, "F5"),
+                     ("AI에게 새로 묻기", lambda: self.start_scan(fresh_ai=True), "Shift+F5"),
+                     ("③ 파일 정리 실행", self.start_move), ("중단", self.cancel_current, "Esc"),
+                     None, ("check", "AI 사용", self.ai_var, self.on_ai_toggle),
+                     ("check", "원본 유지 (복사)", self.copy_var),
+                     None, ("설정…", self.open_settings)])
+        menu("도움말", [("사용 방법", lambda: webbrowser.open(HELP_URL)), None, ("정보", self.show_about)])
+
+        for key, action in (("<Control-o>", self.choose_source), ("<F5>", self.start_scan),
+                            ("<Shift-F5>", lambda: self.start_scan(fresh_ai=True)),
+                            ("<Control-l>", self.edit_user_folders), ("<Escape>", self.cancel_current),
+                            ("<Control-f>", self.focus_search)):
+            self.bind(key, lambda _event, action=action: action())
+
+    def _schedule_search(self) -> None:
+        """글자를 칠 때마다 목록을 다시 그리면 느리므로 잠깐 멈췄을 때 한 번만 그린다."""
+        if getattr(self, "_search_job", None):
+            self.after_cancel(self._search_job)
+        self._search_job = self.after(250, self._run_search)
+
+    def _run_search(self) -> None:
+        self._search_job = None
+        self.refresh_table()
+        if self.search_var.get().strip():
+            self.set_all_folders_open(True)
+
+    def focus_search(self) -> None:
+        self.search_entry.focus_set()
+        self.search_entry.select_range(0, "end")
+
+    def _menu_state(self, menu: str, label: str, enabled: bool) -> None:
+        self.menus[menu].entryconfigure(label, state="normal" if enabled else "disabled")
+
+    def _preview_extra(self) -> dict:
+        return {"ai_snapshot": getattr(self, "ai_snapshot", None), "scan_note": getattr(self, "scan_note", ""),
+                "grouped_snapshot": self.grouped_snapshot}
+
+    def autosave_preview(self) -> None:
+        """미리보기가 있으면 이 PC에 자동 저장한다(파일 ▸ 지난 미리보기 열기). 실패해도 넘어간다."""
+        if self.documents and self.preview_paths:
+            try:
+                save_preview(last_preview_path(), *self.preview_paths, self.documents, self._preview_extra())
+            except (OSError, ValueError):
+                pass
+
+    def open_preview(self, path: Path) -> None:
+        if self.busy:
+            return
+        if not path.is_file():
+            messagebox.showinfo("미리보기 불러오기", "저장된 미리보기 없음")
+            return
+        try:
+            source, destination, documents, extra = load_preview(path)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("미리보기 불러오기", str(exc))
+            return
+        if not source.is_dir():
+            messagebox.showerror("미리보기 불러오기", f"원본 폴더 없음: {source}")
+            return
+        self.source_var.set(str(source))
+        self.destination_var.set(str(destination))
+        self.documents = documents
+        self.preview_paths = (source, destination)
+        snapshot = extra.get("ai_snapshot")
+        self.ai_snapshot = [tuple(row) for row in snapshot] if snapshot else None
+        grouped = extra.get("grouped_snapshot")
+        self.grouped_snapshot = [tuple(row) for row in grouped] if grouped else None
+        self.group_button.configure(text="대분류 풀기" if self.grouped_snapshot else "대분류로 묶기")
+        self.scan_note = extra.get("scan_note", "")
+        self.remember_routes()
+        self.refresh_table()
+        self._set_busy(False)
+        self.status_var.set("미리보기 불러옴 · 바뀐 파일은 정리할 때 걸러짐 · " + self.preview_summary())
+
+    def open_settings(self) -> None:
+        """자주 바꾸지 않는 설정을 한 창에 모은다. 체크박스는 앱이 들고 있는 변수를 쓴다(창마다 만들면 Tcl이 죽는다)."""
+        if self.busy:
+            return
+        window = tk.Toplevel(self)
+        window.title("설정")
+        window.transient(self)
+        window.grab_set()
+        outer = ttk.Frame(window, padding=12)
+        outer.pack(fill="both", expand=True)
+        ttk.Checkbutton(outer, text="읽은 내용 기억 (다음 미리보기가 빨라짐)", variable=self.cache_var).pack(anchor="w")
+        ttk.Checkbutton(outer, text="다른 작업 우선 (분류가 느려지는 대신 PC가 덜 버벅임)",
+                        variable=self.gentle_var).pack(anchor="w", pady=(4, 0))
+        ttk.Label(outer, text="\n정리에서 뺄 폴더·파일 이름 · 한 줄에 하나\n예) 개인   임시*   *.tmp   ~$*").pack(anchor="w")
+        box = tk.Text(outer, width=44, height=8, wrap="none")
+        box.pack(fill="both", expand=True, pady=6)
+        box.insert("1.0", "\n".join(organizer.EXCLUDE))
+        buttons = ttk.Frame(outer)
+        buttons.pack(fill="x")
+
+        def save() -> None:
+            patterns = list(dict.fromkeys(line.strip() for line in box.get("1.0", "end").splitlines() if line.strip()))
+            changed = patterns != organizer.EXCLUDE
+            organizer.EXCLUDE[:] = patterns
+            save_excludes(patterns)
+            window.destroy()
+            if changed:
+                self.status_var.set(f"제외 {len(patterns)}개 · 다음 미리보기부터 적용" if patterns else "제외 없음")
+
+        ttk.Button(buttons, text="기억 지우기…", command=self.clear_saved_cache).pack(side="left")
+        ttk.Button(buttons, text="저장", command=save).pack(side="right")
+        ttk.Button(buttons, text="취소", command=window.destroy).pack(side="right", padx=6)
+
+    def show_about(self) -> None:
+        messagebox.showinfo(
+            "정보", f"문서 OCR 정리 {APP_VERSION}\n\n"
+                   "PC 안에서만 읽고 분류합니다(문서가 인터넷으로 나가지 않음).\n"
+                   "OCR: Tesseract · 로컬 AI: Ollama\n\n라이선스: AGPL-3.0")
 
     def choose_source(self) -> None:
         folder = filedialog.askdirectory(title="정리할 원본 폴더 선택")
@@ -322,7 +438,7 @@ class OrganizerApp(tk.Tk):
         open_paths = {path for item, path in self.folder_rows.items() if self.table.item(item, "open")}
         self.table.delete(*self.table.get_children())
         self.folder_rows.clear()
-        routes = group_preview_documents(self.documents, self.filter_var.get())
+        routes = group_preview_documents(self.documents, self.filter_var.get(), self.search_var.get())
         source_root = self.preview_paths[0] if self.preview_paths else Path(self.source_var.get() or ".")
         keys = {
             "category": lambda doc: (doc.folder.casefold(), (doc.output_name or doc.source.name).casefold()),
@@ -353,7 +469,7 @@ class OrganizerApp(tk.Tk):
                 self.table.insert(
                     parent, "end", iid=file_item, text=doc.output_name or doc.source.name,
                     values=(preview_location(source_root, doc.source),
-                            "읽기 실패" if doc.error else doc.method),
+                            "읽기 실패" if doc.error else "중복" if doc.duplicate_of else ""),
                 )
                 if file_item in selected:
                     restore.append(file_item)
@@ -366,7 +482,7 @@ class OrganizerApp(tk.Tk):
             opened = (path in open_paths or path in selected_under
                       or (len(path) == 1 and len(top_names) == 1))
             self.table.insert(parent, "end", iid=item, text=f"{path[-1]}  ({totals[path]}개)",
-                              values=("", ""), open=opened, tags=("folder",))
+                              values=("", ""), open=opened, tags=(folder_tag(path),))
             if path in selected_paths:
                 restore.append(item)
             insert_files(item, routes.get(path, []))
@@ -380,6 +496,10 @@ class OrganizerApp(tk.Tk):
             self.table.selection_set(restore)
         count = sum(len(indices) for indices in routes.values())
         self.count_var.set(f"{len(self.folder_rows)}개 폴더 · {count}/{len(self.documents)}개 파일")
+        if self.documents:
+            self.empty_hint.place_forget()
+        else:
+            self.empty_hint.place(in_=self.table, relx=0.5, rely=0.45, anchor="center")
         if not restore:
             self.detail_var.set("")
 
@@ -404,24 +524,37 @@ class OrganizerApp(tk.Tk):
         self.scan_button.configure(state="disabled" if busy else "normal")
         self.fresh_button.configure(state="disabled" if busy else "normal")
         self.ai_checkbox.configure(state="disabled" if busy else "normal")
-        self.undo_button.configure(state="disabled" if busy else "normal")
         self.group_button.configure(state="disabled" if busy or not self.documents else "normal")
         self.move_button.configure(state="disabled" if busy or not self.documents or self.preview_paths is None else "normal")
         self.cancel_button.configure(state="normal" if busy and not self.cancel_event.is_set() else "disabled")
+        if busy:
+            self.progress.pack(side="right", padx=(self.px(8), 0))
+            self.progress.start(12)
+        else:
+            self.progress.stop()
+            self.progress.pack_forget()
+        for menu, label in (("도구", "① 미리보기"), ("도구", "AI에게 새로 묻기"), ("파일", "정리 되돌리기…"),
+                            ("편집", FOLDERS_LABEL + "…"), ("도구", "설정…")):
+            self._menu_state(menu, label, not busy)
+        self.undo_button.configure(state="disabled" if busy else "normal")
+        self._menu_state("도구", "③ 파일 정리 실행", not busy and bool(self.documents) and self.preview_paths is not None)
+        self._menu_state("도구", "중단", busy)
+        self._menu_state("파일", "결과 폴더 열기", self.last_result_dir is not None)
 
     def cancel_current(self) -> None:
         if self.busy:
             self.cancel_event.set()
             self.cancel_button.configure(state="disabled")
-            self.status_var.set("지금 처리 중인 파일까지만 하고 멈춥니다…")
+            self.status_var.set("중단 중… (현재 파일 마무리)")
 
     def request_close(self) -> None:
         if not self.busy:
+            self.autosave_preview()  # 손으로 고친 분류도 남긴다.
             self.destroy()
             return
         if not messagebox.askyesno(
             "작업 중 창 닫기",
-            "지금 처리 중인 파일(함께 옮기는 파일 묶음이면 그 묶음)까지만 하고 창을 닫습니다. 이미 옮긴 파일은 결과 폴더에 남고 결과 기록도 저장됩니다. 닫을까요?",
+            "현재 파일(묶음)까지 처리 후 닫기\n· 옮긴 파일 · 기록: 유지\n닫을까요?",
         ):
             return
         self.close_requested = True
@@ -431,7 +564,7 @@ class OrganizerApp(tk.Tk):
         """AI 분류를 켜면 Ollama와 모델이 준비됐는지 먼저 확인한다."""
         if not self.ai_var.get() or self.busy:
             return
-        self.status_var.set("로컬 AI 준비 상태를 확인하는 중입니다…")
+        self.status_var.set("AI 준비 확인 중…")
 
         def work() -> None:
             try:
@@ -445,46 +578,45 @@ class OrganizerApp(tk.Tk):
         if error:
             if find_ollama() is not None:
                 if messagebox.askyesno(
-                    "로컬 AI 준비", "Ollama가 설치돼 있지만 실행 중이 아닙니다. 지금 실행할까요?",
+                    "로컬 AI 준비", "Ollama 꺼짐 · 실행할까요?",
                 ):
                     self.start_ollama_setup(install=False)
                     return
             elif winget_available():
                 if messagebox.askyesno(
                     "로컬 AI 준비",
-                    "로컬 AI 분류에는 무료 프로그램 Ollama가 필요합니다.\n\n"
-                    "Windows 패키지 관리자(winget)로 공식 Ollama를 자동 설치할까요? "
-                    "(약 1GB, 인터넷 필요. 설치하면 Ollama 사용 조건에 동의하게 됩니다)",
+                    "Ollama 필요 (무료)\n\n"
+                    "winget 자동 설치?\n"
+                    "· 약 1GB · 인터넷\n· Ollama 사용 조건 동의",
                 ):
                     self.start_ollama_setup(install=True)
                     return
             elif messagebox.askyesno(
                 "로컬 AI 준비",
-                f"{error}.\n\n로컬 AI 분류에는 무료 프로그램 Ollama가 필요합니다. "
-                "설치하고 실행한 뒤 다시 켜세요.\n\n다운로드 페이지를 열까요?",
+                f"{error}\n\nOllama 필요 (무료) · 설치·실행 후 다시 켜기\n\n다운로드 페이지 열까요?",
             ):
                 webbrowser.open(OLLAMA_DOWNLOAD)
             self.ai_var.set(False)
-            self.status_var.set(f"{error}. Ollama를 설치·실행한 뒤 '로컬 AI 분류'를 다시 켜세요.")
+            self.status_var.set(f"{error} · Ollama 설치·실행 후 'AI 사용' 다시 켜기")
             return
         if not missing:
-            self.status_var.set("로컬 AI 사용 가능")
+            self.status_var.set("AI 준비 완료")
             return
         if messagebox.askyesno(
             "로컬 AI 모델 받기",
-            f"필요한 AI 모델이 아직 없습니다: {', '.join(missing)}\n\n"
-            "처음 한 번만 받으면 됩니다(모두 약 3GB, 인터넷 필요). 지금 받을까요?",
+            f"AI 모델 없음: {', '.join(missing)}\n\n"
+            "· 최초 1회 · 약 3GB · 인터넷\n받을까요?",
         ):
             self.start_model_pull(missing)
         else:
             self.ai_var.set(False)
-            self.status_var.set("AI 모델이 없어 로컬 AI 분류를 껐습니다")
+            self.status_var.set("AI 모델 없음 · AI 분류 끔")
 
     def start_ollama_setup(self, install: bool) -> None:
         """Ollama를 설치(필요하면)하고 실행한 뒤, 이어서 모델 확인 단계로 넘어간다."""
         self.cancel_event.clear()
         self._set_busy(True)
-        self.status_var.set("Ollama를 설치하는 중입니다…" if install else "Ollama를 실행하는 중입니다…")
+        self.status_var.set("Ollama 설치 중…" if install else "Ollama 실행 중…")
 
         def running() -> bool:
             try:
@@ -496,7 +628,7 @@ class OrganizerApp(tk.Tk):
         def work() -> None:
             try:
                 if install:
-                    install_ollama(lambda line: self.events.put(("progress", f"Ollama 설치 중: {line}")),
+                    install_ollama(lambda line: self.events.put(("progress", f"Ollama 설치: {line}")),
                                    should_cancel=self.cancel_event.is_set)
                     # 설치 프로그램이 Ollama를 바로 띄우는 경우가 많아 잠시 기다려 본다.
                     if not wait_until_running(running, timeout=15):
@@ -540,20 +672,37 @@ class OrganizerApp(tk.Tk):
             return
         path = default_cache_path()
         if not messagebox.askyesno(
-            "저장 내용 지우기",
-            f"이 PC에 저장한 파일 해시·읽은 본문·AI 응답을 지울까요?\n{path}\n"
-            "원본 파일은 그대로이고, 다음 미리보기만 처음처럼 오래 걸립니다.",
+            "기억 지우기",
+            f"읽은 내용·AI 답 기억을 지울까요?\n{path}\n"
+            "· 원본 파일은 그대로 · 다음 미리보기가 처음처럼 느려짐",
         ):
             return
         try:
             clear_cache(path)
         except OSError as exc:
-            messagebox.showerror("저장 내용 지우기", str(exc))
+            messagebox.showerror("기억 지우기", str(exc))
             return
-        self.status_var.set("저장한 내용을 지웠습니다")
+        self.status_var.set("기억 지움")
 
     def preview_summary(self, counts: bool = True) -> str:
-        """미리보기 요약: 개수, 확인 권장 신호, 구조 점수."""
+        """상태 표시줄 한 줄 요약. 전체 내용(점검 항목·구조 점수 세부·AI 메모)은 self.summary_detail에 둔다."""
+        quality = quality_check(self.documents)
+        unknown = sum(doc.folder == "미분류" for doc in self.documents)
+        note = getattr(self, "scan_note", "")
+        short = [f"파일 {len(self.documents)}",
+                 f"폴더 {len({doc.folder for doc in self.documents if doc.folder and doc.folder != '미분류'})}",
+                 f"미분류 {unknown}"]
+        if "AI 새로 물음" in note:
+            short.append("AI 새로 물음")
+        if quality.warnings:
+            short.append(f"⚠ 확인 {len(quality.warnings)}개 → 자세히")
+        self.summary_detail = "\n\n".join(part for part in (
+            self._full_summary(counts), "확인할 것:\n" + "\n".join(f"· {w}" for w in quality.warnings)
+            if quality.warnings else "") if part)
+        self.detail_button.configure(state="normal")
+        return " · ".join(short)
+
+    def _full_summary(self, counts: bool = True) -> str:
         lines = []
         if counts:
             unknown = sum(doc.folder == "미분류" for doc in self.documents)
@@ -562,13 +711,16 @@ class OrganizerApp(tk.Tk):
             filename_only = sum(document.source.suffix.lower() not in SUPPORTED for document in self.documents)
             folder_count = len({doc.folder for doc in self.documents if doc.folder and doc.folder != "미분류"})
             lines.append(
-                f"{len(self.documents)}개 확인 · 제안 폴더 {folder_count}개 · "
-                f"미분류 {unknown}개 · 읽기 실패 {failed}개 · "
-                f"동일 파일 {duplicates}개 · 파일명 기준 {filename_only}개."
-                + (f" {self.scan_note}" if getattr(self, "scan_note", "") else ""))
+                f"파일 {len(self.documents)} · 폴더 {folder_count} · "
+                f"미분류 {unknown} · 읽기 실패 {failed} · "
+                f"중복 {duplicates} · 파일명만 {filename_only}"
+                + (f" · {self.scan_note}" if getattr(self, "scan_note", "") else ""))
         lines.append(quality_check(self.documents).summary())
-        lines.append(structure_score(self.documents).summary() + " (기록관리 지침으로 본 찾기 쉬운 정도)")
+        lines.append(structure_score(self.documents).summary() + " (기록관리 기준)")
         return "\n".join(lines)
+
+    def show_summary_detail(self) -> None:
+        messagebox.showinfo("분류 요약", getattr(self, "summary_detail", "") or "아직 미리보기 전")
 
     def toggle_top_level(self) -> None:
         """세부 주제 폴더를 AI가 만든 대분류 아래로 묶거나, 묶기 전으로 되돌린다."""
@@ -576,7 +728,7 @@ class OrganizerApp(tk.Tk):
             return
         if self.grouped_snapshot is not None:
             if not messagebox.askyesno(
-                "대분류 풀기", "대분류를 풀면 묶은 뒤 바꾼 분류도 묶기 전 상태로 돌아갑니다. 풀까요?",
+                "대분류 풀기", "묶기 전으로 복귀 (묶은 뒤 수정도 취소)\n풀까요?",
             ):
                 return
             for doc, (folder, subfolder, detail, reason) in zip(self.documents, self.grouped_snapshot):
@@ -584,38 +736,41 @@ class OrganizerApp(tk.Tk):
             self.grouped_snapshot = None
             self.group_button.configure(text="대분류로 묶기")
             self.refresh_table()
-            self.status_var.set("대분류를 풀었습니다.\n" + self.preview_summary(counts=False))
+            self.status_var.set("대분류 해제 · " + self.preview_summary(counts=False))
             return
         topics = {doc.folder for doc in self.documents if doc.duplicate_of is None
                   and doc.folder not in {"", "미분류"} and doc.folder not in HIERARCHY_FORMAT_FOLDERS}
         if len(topics) < MIN_TOPICS:
             messagebox.showinfo(
                 "대분류로 묶기",
-                f"주제 폴더가 {len(topics)}개라 이미 한눈에 보입니다. {MIN_TOPICS}개 이상일 때 묶습니다.")
+                f"주제 폴더 {len(topics)}개 · 이미 한눈에 보임\n{MIN_TOPICS}개 이상부터 묶기")
             return
         snapshot = [(doc.folder, doc.subfolder, doc.detail, doc.folder_reason) for doc in self.documents]
         fresh_ai = getattr(self, "fresh_ai_last", False)
         documents = copy.deepcopy(self.documents)  # 작업 스레드는 사본만 고친다.
         use_cache = self.cache_var.get()
+        gentle = self.gentle_var.get()
         self.cancel_event.clear()
         self._set_busy(True)
-        self.status_var.set("AI로 대분류를 만드는 중입니다…")
+        self.status_var.set("AI 대분류 생성 중…")
 
         def work() -> None:
+            set_gentle(gentle)
             try:
                 if ollama_missing_models():
-                    raise RuntimeError("AI 모델이 없습니다. '로컬 AI 분류'를 켜서 먼저 준비하세요")
+                    raise RuntimeError("AI 모델 없음 · 'AI 사용'을 켜서 준비")
                 with contextlib.ExitStack() as stack:
                     cache = stack.enter_context(LocalCache(default_cache_path())) if use_cache else None
                     # 'AI로 새로 분류'한 결과라면 대분류도 새로 묻는다.
                     calls = cached_hierarchy(cache.responses(fresh=fresh_ai)) if cache else {}
-                    reporter = progress_reporter(self.events, "대분류로 묶는 중")
+                    reporter = progress_reporter(self.events, "대분류")
                     plan = add_top_level(documents, stage=reporter.stage, **calls)
                 self.events.put(("grouped", documents, snapshot, plan, ""))
             except (OSError, RuntimeError, ValueError) as exc:
                 self.events.put(("grouped", None, snapshot, {}, f"대분류를 만들지 못했습니다: {exc}"))
             finally:
                 ollama_unload()
+                set_gentle(False)
 
         threading.Thread(target=work, daemon=False).start()
 
@@ -629,6 +784,8 @@ class OrganizerApp(tk.Tk):
         source, destination = paths
         use_ai = self.ai_var.get()
         use_cache = self.cache_var.get()
+        gentle = self.gentle_var.get()
+        targets, allow_new = list(self.user_folders), self.allow_new_folders
         if fresh_ai:
             self.ai_var.set(True)
             use_ai = True
@@ -638,49 +795,64 @@ class OrganizerApp(tk.Tk):
         self.refresh_table()
         self.cancel_event.clear()
         self._set_busy(True)
-        self.status_var.set("문서를 읽는 중입니다…")
+        self.status_var.set("읽기 시작…")
 
         def work() -> None:
+            set_gentle(gentle)
             try:
                 if use_ai:
                     # 긴 읽기를 마친 뒤에야 모델이 없다고 알리지 않도록 먼저 확인한다.
                     missing = ollama_missing_models()
                     if missing:
                         raise RuntimeError(
-                            f"AI 모델이 없습니다: {', '.join(missing)}. "
-                            "'로컬 AI 분류'를 껐다 다시 켜면 받을 수 있습니다")
+                            f"AI 모델 없음: {', '.join(missing)} · 'AI 사용'을 껐다 켜서 받기")
                 # 저장소는 이 작업 스레드에서만 열고 닫는다.
                 with contextlib.ExitStack() as stack:
                     cache = stack.enter_context(LocalCache(default_cache_path())) if use_cache else None
                     documents = scan(
                         source, destination, find_tesseract(),
-                        progress_reporter(self.events, "문서 읽는 중"),
+                        progress_reporter(self.events, "읽기"),
                         should_cancel=self.cancel_event.is_set,
                         classify=not use_ai, cache=cache,
                     )
                     if self.cancel_event.is_set():
                         raise InterruptedError("검사가 중단되었습니다")
+                    count = sum(doc.duplicate_of is None for doc in documents)
+                    # 천천히 실행은 요청마다 일한 시간의 절반을 쉬므로 1.5배로 잡는다.
+                    expected = count * ai_seconds_per_document(cache) * (1.5 if gentle else 1) if use_ai else None
                     if use_ai:
-                        self.events.put(("progress", "로컬 AI가 문서 내용을 비교하고 폴더 이름을 짓는 중입니다…"))
-                    reporter = progress_reporter(self.events, "로컬 AI 분류 중")
+                        self.events.put(("progress", f"AI 분류 · {count}개 · 예상 {_duration(expected)}"))
+                    reporter = progress_reporter(self.events, "AI 분류", whole=expected)
                     ai_note = ai_preview_note(
                         documents, use_ai,
-                        progress=reporter, stage=lambda name: reporter.stage(f"로컬 AI · {name}"),
+                        progress=reporter, stage=lambda name: reporter.stage(f"AI · {name}"),
                         should_cancel=self.cancel_event.is_set,
                         calls=cached_ollama(cache.responses(fresh=fresh_ai)) if cache else None,
                         source_root=source,
                     )
+                    if use_ai and not gentle:
+                        remember_ai_speed(cache, time.monotonic() - reporter.began, count)
+                    ai_snapshot = ([(d.folder, d.subfolder, d.detail, d.folder_reason) for d in documents]
+                                   if use_ai else None)
+                    if use_ai and targets:
+                        if self.cancel_event.is_set():
+                            raise InterruptedError("검사가 중단되었습니다")
+                        pick = (cached_hierarchy(cache.responses(fresh=fresh_ai))["user_pick"] if cache
+                                else ollama_user_pick)
+                        fit_user_folders(documents, targets, pick, allow_new,
+                                         stage=lambda name: reporter.stage(f"AI · {name}"))
+                        ai_note += f" · 지정 폴더 {len(targets)}개"
                 if self.cancel_event.is_set():
                     raise InterruptedError("검사가 중단되었습니다")
                 projects = source_files(source, destination)[1]
                 if projects:
                     names = ", ".join(project.name for project in projects[:3])
                     more = f" 외 {len(projects) - 3}개" if len(projects) > 3 else ""
-                    ai_note = (f"코드 프로젝트·압축 푼 문서 폴더 {len(projects)}개({names}{more})는 그대로 둡니다. "
+                    ai_note = (f"제외: 코드·압축 폴더 {len(projects)}개({names}{more}) · "
                                + ai_note)
                 if fresh_ai:
-                    ai_note = "저장된 AI 답 대신 새로 물었습니다. " + ai_note
-                self.events.put(("scanned", documents, paths, ai_note))
+                    ai_note = "AI 새로 물음 · " + ai_note
+                self.events.put(("scanned", documents, paths, ai_note, ai_snapshot))
             except InterruptedError:
                 self.events.put(("cancelled_scan",))
             except Exception as exc:
@@ -688,6 +860,7 @@ class OrganizerApp(tk.Tk):
             finally:
                 if use_ai:
                     ollama_unload()
+                set_gentle(False)
 
         threading.Thread(target=work, daemon=False).start()
 
@@ -723,12 +896,11 @@ class OrganizerApp(tk.Tk):
             return
         for row in (self.drag_target, self.drag_hover):
             if row and self.table.exists(row):
-                self.table.item(row, tags=("folder",) if row in self.folder_rows else ())
+                self.table.item(row, tags=row_tags(self.folder_rows, row))
         self.drag_target, self.drag_hover = item, hover
         for row in (item, hover):
             if row and self.table.exists(row):
-                base = ("folder",) if row in self.folder_rows else ()
-                self.table.item(row, tags=base + ("drop_target",))
+                self.table.item(row, tags=row_tags(self.folder_rows, row) + ("drop_target",))
         self.table.configure(cursor="hand2" if item else "")
 
     def _move_drag_preview(self, x_root: int, y_root: int, target: str | None) -> None:
@@ -824,10 +996,12 @@ class OrganizerApp(tk.Tk):
         self.drag_indices = []
         self.drag_active = False
         if not target or self.busy:
-            self.status_var.set("폴더 안에 놓으세요")
+            self.status_var.set("폴더 위에 놓기")
             return "break"
         folder, subfolder, detail = (*target, "", "")[:3]
+        before = self._edit_state()
         changed = reassign_documents(self.documents, indices, folder, subfolder, detail)
+        self._remember_edit(before)
         self.refresh_table()
         self.status_var.set(f"{len(changed)}개 파일 → {' / '.join(target)}")
         return "break"
@@ -891,7 +1065,7 @@ class OrganizerApp(tk.Tk):
                 return
             doc = self.documents[indices[0]]
             if doc.duplicate_of is not None or doc.preserve_structure:
-                messagebox.showinfo("이름 바꾸기", "이 파일은 이름을 바꿀 수 없습니다")
+                messagebox.showinfo("이름 바꾸기", "이름 변경 불가")
                 return
             current = Path(doc.output_name or doc.source.name).stem
         self.table.see(item)
@@ -949,6 +1123,7 @@ class OrganizerApp(tk.Tk):
         self.cancel_rename()
         if not name or not item:
             return "break"
+        before = self._edit_state()
         try:
             path = self.folder_rows.get(item)
             if path:
@@ -959,7 +1134,7 @@ class OrganizerApp(tk.Tk):
                     and route(doc)[depth - 1] != path[-1] and route(doc)[depth - 1].casefold() == key
                     for doc in self.documents)
                 if existing and not messagebox.askyesno(
-                    "폴더 합치기", f"'{name}' 폴더가 이미 있습니다. 두 폴더를 합칠까요?",
+                    "폴더 합치기", f"'{name}' 폴더 있음 · 합칠까요?",
                 ):
                     return "break"
                 if name != path[-1]:
@@ -980,6 +1155,7 @@ class OrganizerApp(tk.Tk):
         except ValueError as exc:
             messagebox.showerror("이름 바꾸기", str(exc))
             return "break"
+        self._remember_edit(before)
         self.refresh_table()
         if new_route:
             target = next((row for row, route in self.folder_rows.items() if route == new_route), None)
@@ -989,6 +1165,128 @@ class OrganizerApp(tk.Tk):
         self.status_var.set(f"이름 변경: {name}")
         return "break"
 
+    def edit_user_folders(self) -> None:
+        """폴더명 지정 창. 처음에는 AI가 만든 폴더를 파일 수와 함께 채워 둔다."""
+        if self.busy:
+            return
+        snapshot = getattr(self, "ai_snapshot", None)
+        if snapshot and len(snapshot) == len(self.documents):
+            routes = [(folder, sub) for (folder, sub, _, _), doc in zip(snapshot, self.documents)
+                      if doc.duplicate_of is None]
+        else:
+            routes = [(doc.folder, doc.subfolder) for doc in self.documents if doc.duplicate_of is None]
+        ai_counts = folder_counts(routes)
+        suggestions = [name for name, _ in ai_counts.most_common() if "/" not in name]
+        # 지정 폴더별 파일 수는 지금 미리보기 기준으로 보여 준다.
+        counts = folder_counts([(doc.folder, doc.subfolder) for doc in self.documents if doc.duplicate_of is None])
+        counts.update({name: n for name, n in ai_counts.items() if name not in counts})
+        self.allow_new_var.set(self.allow_new_folders)
+
+        def save(targets: list[str]) -> None:
+            self.user_folders, self.allow_new_folders = targets, self.allow_new_var.get()
+            save_user_folders(targets, self.allow_new_folders)
+            self.folders_button.configure(text=user_folders_label(targets))
+            self.apply_user_folders()
+
+        self.folder_editor = FolderEditor(self, self.user_folders, suggestions, counts, self.allow_new_var, save,
+                                          px=self.px, suggest_groups=self.suggest_folder_groups)
+
+    def remember_routes(self) -> None:
+        """지금 분류를 기준으로 기억한다. 이후 달라진 파일은 사용자가 직접 고친 것이다."""
+        self.base_routes = [(doc.folder, doc.subfolder, doc.detail, doc.output_name) for doc in self.documents]
+        self.undo_edits = []
+
+    def _edit_state(self) -> list[tuple[str, str, str, str, str]]:
+        return [(doc.folder, doc.subfolder, doc.detail, doc.output_name, doc.folder_reason) for doc in self.documents]
+
+    def _remember_edit(self, before: list[tuple[str, str, str, str, str]]) -> None:
+        if before != self._edit_state():
+            self.undo_edits = (getattr(self, "undo_edits", []) + [before])[-UNDO_LIMIT:]
+
+    def undo_edit(self) -> None:
+        """마지막으로 손으로 고친 것을 되돌린다(최대 UNDO_LIMIT번)."""
+        edits = getattr(self, "undo_edits", [])
+        if self.busy or not edits or len(edits[-1]) != len(self.documents):
+            self.status_var.set("되돌릴 수정 없음")
+            return
+        for doc, (folder, sub, detail, name, reason) in zip(self.documents, edits.pop()):
+            doc.folder, doc.subfolder, doc.detail, doc.output_name, doc.folder_reason = folder, sub, detail, name, reason
+        self.refresh_table()
+        self.status_var.set(f"수정 되돌림 · 남은 되돌리기 {len(edits)}번")
+
+    def manual_edit_count(self) -> int:
+        base = getattr(self, "base_routes", None)
+        if not base or len(base) != len(self.documents):
+            return 0
+        return sum(route != (doc.folder, doc.subfolder, doc.detail, doc.output_name)
+                   for route, doc in zip(base, self.documents))
+
+    def suggest_folder_groups(self, names: list[str]) -> None:
+        """폴더명 지정 창의 'AI 묶기 제안'. 대분류로 묶기와 같은 AI 단계로 {폴더: 상위} 안을 만든다."""
+        by_folder: dict[str, list[Document]] = {}
+        for doc in self.documents:
+            by_folder.setdefault(doc.folder, []).append(doc)
+        documents = [copy.deepcopy(doc) for name in names for doc in by_folder.get(name, [])[:5]]
+        # 사용자가 새로 적은 이름은 파일이 없으니 이름만 가진 문서로 보낸다.
+        documents += [Document(Path(f"{name}.txt"), name, "", "") for name in names if name not in by_folder]
+        use_cache = self.cache_var.get()
+
+        def work() -> None:
+            try:
+                if ollama_missing_models():
+                    raise RuntimeError("AI 모델 없음 · 'AI 사용'을 켜서 준비")
+                with contextlib.ExitStack() as stack:
+                    cache = stack.enter_context(LocalCache(default_cache_path())) if use_cache else None
+                    calls = cached_hierarchy(cache.responses()) if cache else {}
+                    calls = {key: call for key, call in calls.items() if key in {"taxonomy", "pick", "embed"}}
+                    plan = add_top_level(documents, min_topics=3, **calls)
+                self.events.put(("group_suggestion", plan, ""))
+            except (OSError, RuntimeError, ValueError) as exc:
+                self.events.put(("group_suggestion", {}, f"AI 묶기 실패: {exc}"))
+            finally:
+                ollama_unload()
+
+        threading.Thread(target=work, daemon=False).start()
+
+    def apply_user_folders(self) -> None:
+        """지금 미리보기의 AI 결과에 지정 폴더를 다시 맞춘다. 읽기·AI 묶기는 다시 하지 않는다."""
+        snapshot = getattr(self, "ai_snapshot", None)
+        if not snapshot or not self.documents or len(snapshot) != len(self.documents):
+            self.status_var.set(f"지정 폴더 {len(self.user_folders)}개 · 다음 미리보기부터 적용"
+                                if self.user_folders else "지정 폴더 없음 · 자동 분류")
+            return
+        edited = self.manual_edit_count()
+        if edited and not messagebox.askyesno(
+                "폴더 구조 정하기", f"직접 고친 파일 {edited}개가 AI 결과 기준으로 돌아갑니다.\n다시 맞출까요?"):
+            self.status_var.set(f"지정 폴더 {len(self.user_folders)}개 저장 · 다음 미리보기부터 적용")
+            return
+        documents = copy.deepcopy(self.documents)
+        for doc, (folder, sub, detail, reason) in zip(documents, snapshot):
+            doc.folder, doc.subfolder, doc.detail, doc.folder_reason = folder, sub, detail, reason
+        targets, allow_new, use_cache = list(self.user_folders), self.allow_new_folders, self.cache_var.get()
+        if not targets:
+            self.events.put(("fitted", "지정 폴더 없음 · 자동 분류", documents))
+            self._set_busy(True)
+            return
+        self.cancel_event.clear()
+        self._set_busy(True)
+        self.status_var.set(f"지정 폴더 {len(targets)}개에 맞추는 중…")
+
+        def work() -> None:
+            try:
+                with contextlib.ExitStack() as stack:
+                    cache = stack.enter_context(LocalCache(default_cache_path())) if use_cache else None
+                    pick = cached_hierarchy(cache.responses())["user_pick"] if cache else ollama_user_pick
+                    fit_user_folders(documents, targets, pick, allow_new,
+                                     stage=lambda name: self.events.put(("progress", f"AI · {name}…")))
+                self.events.put(("fitted", f"지정 폴더 {len(targets)}개 적용", documents))
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+            finally:
+                ollama_unload()
+
+        threading.Thread(target=work, daemon=False).start()
+
     def create_folder_for_selection(self) -> None:
         indices = selected_file_indices(self.table.selection())
         if not indices:
@@ -996,11 +1294,13 @@ class OrganizerApp(tk.Tk):
         name = simpledialog.askstring("새 주제 폴더", "폴더 이름", parent=self)
         if name is None:
             return
+        before = self._edit_state()
         try:
             changed = reassign_documents(self.documents, indices, name.strip(), "")
         except ValueError as exc:
             messagebox.showerror("폴더 이름", str(exc))
             return
+        self._remember_edit(before)
         self.refresh_table()
         self.status_var.set(f"{len(changed)}개 파일 → {name.strip()}")
 
@@ -1012,8 +1312,10 @@ class OrganizerApp(tk.Tk):
         name = simpledialog.askstring("새 하위 폴더", "하위 폴더 이름", parent=self)
         if name is None:
             return
+        before = self._edit_state()
         try:
             changed = reassign_documents(self.documents, indices, folder, name.strip())
+            self._remember_edit(before)
         except ValueError as exc:
             messagebox.showerror("폴더 이름", str(exc))
             return
@@ -1040,29 +1342,29 @@ class OrganizerApp(tk.Tk):
 
     def show_selected_preview(self) -> None:
         if self.busy or not self.table.selection():
-            messagebox.showinfo("미리보기", "목록에서 파일이나 폴더를 먼저 선택하세요")
+            messagebox.showinfo("미리보기", "파일·폴더 선택 필요")
             return
         item = self.table.selection()[0]
         selected = preview_selection(self.documents, self.folder_rows, item)
         if not selected:
-            messagebox.showinfo("미리보기", "선택한 항목에 파일이 없습니다")
+            messagebox.showinfo("미리보기", "파일 없음")
             return
         folder_row = self.folder_rows.get(item)
         if not folder_row:
             # 파일은 연결된 프로그램으로 바로 연다. 실행 파일 같은 형식만 먼저 묻는다.
             document = selected[0]
             if document.source.suffix.casefold() in CONFIRM_BEFORE_OPEN:
-                if not messagebox.askyesno("파일 열기", f"{document.source.name} 파일을 열까요?"):
+                if not messagebox.askyesno("파일 열기", f"{document.source.name}\n실행 파일 · 열까요?"):
                     return
             try:
                 os.startfile(document.source)
             except OSError as exc:
-                messagebox.showerror("파일 열기", f"파일을 열지 못했습니다: {exc}")
+                messagebox.showerror("파일 열기", f"열기 실패: {exc}")
             return
         window = tk.Toplevel(self)
         window.title("폴더 미리보기")
-        window.geometry("880x660")
-        window.minsize(560, 380)
+        window.geometry(f"{self.px(880)}x{self.px(660)}")
+        window.minsize(self.px(560), self.px(380))
         window.transient(self)
         window.bind("<Escape>", lambda _event: window.destroy())
         outer = ttk.Frame(window, padding=12)
@@ -1101,26 +1403,26 @@ class OrganizerApp(tk.Tk):
         try:
             jobs = undo_jobs(report)
         except (OSError, ValueError, KeyError) as exc:
-            messagebox.showerror("정리 되돌리기", f"기록을 읽을 수 없습니다: {exc}")
+            messagebox.showerror("정리 되돌리기", f"기록 읽기 실패: {exc}")
             return
         if not jobs:
-            messagebox.showinfo("정리 되돌리기", "이 기록에는 되돌릴 파일이 없습니다")
+            messagebox.showinfo("정리 되돌리기", "되돌릴 파일 없음")
             return
         if not messagebox.askyesno(
             "정리 되돌리기",
-            f"{len(jobs)}개 파일을 정리 전 위치로 되돌릴까요?\n"
-            "원래 위치에 같은 이름의 파일이 새로 생겼으면 그 파일은 건너뜁니다.",
+            f"{len(jobs)}개 파일 되돌리기?\n"
+            "· 원래 위치에 같은 이름 새 파일: 건너뜀",
         ):
             return
         self.cancel_event.clear()
         self._set_busy(True)
-        self.status_var.set("파일을 원래 위치로 되돌리는 중입니다…")
+        self.status_var.set("되돌리는 중…")
 
         def work() -> None:
             try:
                 restored, errors = undo_report(
                     report,
-                    progress_reporter(self.events, "되돌리는 중"),
+                    progress_reporter(self.events, "되돌리기"),
                     should_cancel=self.cancel_event.is_set,
                 )
                 self.events.put(("undone", restored, errors, len(jobs)))
@@ -1139,9 +1441,19 @@ class OrganizerApp(tk.Tk):
 
         # 미리보기와 다른 폴더를 정리하면 화면에 보인 분류가 틀어질 수 있다.
         if self.preview_paths != paths:
-            messagebox.showerror("미리보기 확인", "원본 또는 결과 폴더가 바뀌었습니다. 미리보기를 다시 실행하세요")
+            messagebox.showerror("미리보기 확인", "폴더 변경됨 · 미리보기 다시")
             return
-        if not messagebox.askyesno("이동 확인", move_confirmation_text(self.documents)):
+        copy_mode = self.copy_var.get()
+        try:
+            short, free = space_needed(self.documents, destination, copy_mode)
+        except OSError:
+            short, free = 0, 0  # 공간을 못 재면 막지 않는다. 옮기다 실패하면 파일마다 실패로 남는다.
+        if short:
+            messagebox.showerror("공간 부족", f"결과 폴더 드라이브 공간 부족\n· 남은 공간 {size_text(free)}\n"
+                                              f"· 더 필요 {size_text(short)}\n다른 드라이브를 고르거나 공간을 비우세요")
+            return
+        if not messagebox.askyesno("복사 확인" if copy_mode else "이동 확인",
+                                   move_confirmation_text(self.documents, copy_mode)):
             return
         try:
             destination.mkdir(parents=True, exist_ok=True)
@@ -1150,7 +1462,7 @@ class OrganizerApp(tk.Tk):
             return
         self.cancel_event.clear()
         self._set_busy(True)
-        self.status_var.set("파일을 검증하며 이동 중입니다…")
+        self.status_var.set("복사 중 (검증)…" if copy_mode else "이동 중 (검증)…")
 
         def work() -> None:
             try:
@@ -1158,12 +1470,13 @@ class OrganizerApp(tk.Tk):
                 with ResultReport(source, destination, self.documents) as report:
                     moved, deduplicated, errors = move_documents(
                         self.documents, destination,
-                        progress_reporter(self.events, "이동 중"),
+                        progress_reporter(self.events, "복사" if copy_mode else "이동"),
                         should_cancel=self.cancel_event.is_set,
                         source_root=source,
                         record=report.record,
+                        keep_originals=copy_mode,
                     )
-                self.events.put(("moved", moved, deduplicated, errors, destination, report.path))
+                self.events.put(("moved", moved, deduplicated, errors, destination, report.path, copy_mode))
             except Exception as exc:
                 self.events.put(("error", str(exc)))
 
@@ -1180,12 +1493,15 @@ class OrganizerApp(tk.Tk):
                 elif kind == "scanned":
                     self.documents = event[1]
                     self.preview_paths = event[2]
+                    self.ai_snapshot = event[4] if len(event) > 4 else None
                     self.grouped_snapshot = None
                     self.group_button.configure(text="대분류로 묶기")
                     self.refresh_table()
                     self.scan_note = event[3]
                     self.status_var.set(self.preview_summary())
                     self._set_busy(False)
+                    self.remember_routes()
+                    self.autosave_preview()
                 elif kind == "grouped":
                     grouped, snapshot, plan, error = event[1:]
                     self._set_busy(False)
@@ -1194,30 +1510,42 @@ class OrganizerApp(tk.Tk):
                         if not self.close_requested:
                             messagebox.showerror("대분류로 묶기", error)
                     elif not plan:
-                        self.status_var.set("묶을 만한 대분류를 찾지 못해 그대로 두었습니다")
+                        self.status_var.set("묶을 대분류 없음 · 그대로")
                         if not self.close_requested:
-                            messagebox.showinfo("대분류로 묶기", "묶을 만한 대분류를 찾지 못해 그대로 두었습니다.")
+                            messagebox.showinfo("대분류로 묶기", "묶을 대분류 없음 · 그대로")
                     else:
                         self.documents = grouped
                         self.grouped_snapshot = snapshot
                         self.group_button.configure(text="대분류 풀기")
                         self.refresh_table()
                         self.status_var.set(
-                            f"세부 주제 {len(plan)}개를 대분류 {len(set(plan.values()))}개로 묶었습니다. "
-                            "마음에 들지 않으면 끌어서 옮기거나 '대분류 풀기'를 누르세요.\n"
-                            + self.preview_summary(counts=False))
+                            f"대분류 {len(set(plan.values()))}개 ← 세부 주제 {len(plan)}개 · 끌어서 수정 / '대분류 풀기'\n"
+                            .rstrip("\n") + " · " + self.preview_summary(counts=False))
+                elif kind == "group_suggestion":
+                    editor = getattr(self, "folder_editor", None)
+                    if editor is not None:
+                        editor.apply_groups(event[1], event[2])
+                elif kind == "fitted":
+                    self.documents = event[2]
+                    self.remember_routes()
+                    self._set_busy(False)
+                    self.grouped_snapshot = None
+                    self.group_button.configure(text="대분류로 묶기")
+                    self.refresh_table()
+                    self.status_var.set(event[1] + " · " + self.preview_summary(counts=False))
                 elif kind == "cancelled_scan":
                     self.preview_paths = None
-                    self.status_var.set("검사가 중단되었습니다. 원본 파일은 그대로 있습니다.")
+                    self.status_var.set("중단됨 · 원본 그대로")
                     self._set_busy(False)
                 elif kind == "moved":
-                    moved, deduplicated, errors, destination, report = event[1:]
+                    moved, deduplicated, errors, destination, report = event[1:6]
+                    verb, dup = ("복사", "중복 건너뜀") if len(event) > 6 and event[6] else ("이동", "중복 정리")
                     unprocessed = len(self.documents) - len(moved) - len(deduplicated) - len(errors)
                     self.preview_paths = None
                     self.last_result_dir = destination
                     self.open_button.configure(state="normal")
                     self.status_var.set(
-                        f"{len(moved)}개 이동 · 중복 원본 {len(deduplicated)}개 정리 · 실패 {len(errors)}개 · 미처리 {unprocessed}개 · {destination}"
+                        f"{verb} {len(moved)} · {dup} {len(deduplicated)} · 실패 {len(errors)} · 미처리 {unprocessed} · {destination}"
                         + f" · 기록 {report.name}"
                     )
                     self._set_busy(False)
@@ -1225,11 +1553,12 @@ class OrganizerApp(tk.Tk):
                         continue
                     if errors or unprocessed:
                         detail = "\n".join(f"{doc.source.name}: {error}" for doc, error in errors[:8])
-                        messagebox.showwarning("정리 결과", f"이동 실패 {len(errors)}개, 미처리 {unprocessed}개. 남은 원본을 확인하고 미리보기를 다시 실행하세요.\n{detail}")
+                        messagebox.showwarning("정리 결과", f"실패 {len(errors)} · 미처리 {unprocessed}\n남은 원본 확인 → 미리보기 다시\n{detail}")
                     else:
-                        messagebox.showinfo(
-                            "정리 결과", f"{len(moved)}개 이동, 중복 원본 {len(deduplicated)}개 정리.\n{destination}"
-                        )
+                        if messagebox.askyesno(
+                                "정리 결과",
+                                f"{verb} {len(moved)} · {dup} {len(deduplicated)}\n{destination}\n\n결과 폴더를 열까요?"):
+                            self.open_result()
                 elif kind == "ai_setup":
                     self._handle_ai_setup(event[1], event[2])
                 elif kind == "ollama_ready":
@@ -1241,7 +1570,7 @@ class OrganizerApp(tk.Tk):
                             messagebox.showerror("로컬 AI 준비", event[1])
                     else:
                         # 실행되면 바로 모델 확인으로 이어서, 없으면 받기를 묻는다.
-                        self.status_var.set("Ollama를 실행했습니다. AI 모델을 확인하는 중입니다…")
+                        self.status_var.set("Ollama 실행됨 · 모델 확인 중…")
                         self.on_ai_toggle()
                 elif kind == "pulled":
                     self._set_busy(False)
@@ -1251,7 +1580,7 @@ class OrganizerApp(tk.Tk):
                         if not self.close_requested:
                             messagebox.showerror("AI 모델 받기", event[1])
                     else:
-                        self.status_var.set("AI 모델을 받았습니다. 로컬 AI 사용 가능")
+                        self.status_var.set("AI 모델 받음 · 준비 완료")
                 elif kind == "undone":
                     restored, errors, total = event[1:]
                     # 파일 위치가 바뀌었으므로 예전 미리보기로는 정리할 수 없다.
@@ -1261,7 +1590,7 @@ class OrganizerApp(tk.Tk):
                     skipped = total - len(restored) - len(errors)
                     self.status_var.set(
                         f"되돌리기: {len(restored)}개 복원 · 실패 {len(errors)}개"
-                        + (f" · 중단으로 미처리 {skipped}개" if skipped else "")
+                        + (f" · 중단 미처리 {skipped}개" if skipped else "")
                     )
                     self._set_busy(False)
                     if self.close_requested:
@@ -1270,10 +1599,10 @@ class OrganizerApp(tk.Tk):
                         detail = "\n".join(f"{path.name}: {error}" for path, error in errors[:8])
                         messagebox.showwarning(
                             "되돌리기 결과",
-                            f"{len(restored)}개를 원래 위치로 되돌렸습니다. 실패 {len(errors)}개, 미처리 {skipped}개.\n{detail}",
+                            f"복원 {len(restored)} · 실패 {len(errors)} · 미처리 {skipped}\n{detail}",
                         )
                     else:
-                        messagebox.showinfo("되돌리기 결과", f"{len(restored)}개를 모두 원래 위치로 되돌렸습니다.")
+                        messagebox.showinfo("되돌리기 결과", f"복원 {len(restored)}개 완료")
                 elif kind == "error":
                     self.status_var.set(event[1])
                     self.preview_paths = None
@@ -1288,5 +1617,27 @@ class OrganizerApp(tk.Tk):
         self.after(100, self.poll_events)
 
 
+def set_gentle(enabled: bool) -> None:
+    """'천천히 실행': 이 앱과 OCR 프로세스의 우선순위를 낮추고, AI 요청도 가볍게 보낸다."""
+    ai_groups.GENTLE = enabled
+    try:
+        import ctypes
+        kernel = ctypes.windll.kernel32
+        # BELOW_NORMAL_PRIORITY_CLASS / NORMAL_PRIORITY_CLASS. 낮춘 우선순위는 OCR 자식 프로세스도 물려받는다.
+        kernel.SetPriorityClass(kernel.GetCurrentProcess(), 0x4000 if enabled else 0x20)
+    except (AttributeError, OSError):
+        pass
+
+
+def enable_sharp_display() -> None:
+    """Windows 화면 배율을 직접 처리해 글자가 흐리게 늘어나지 않게 한다. 실패해도 예전처럼 동작한다."""
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except (AttributeError, OSError):
+        pass
+
+
 if __name__ == "__main__":
+    enable_sharp_display()
     OrganizerApp().mainloop()

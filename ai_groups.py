@@ -90,10 +90,20 @@ class _ServerError(RuntimeError):
     """Ollama 쪽 일시 오류(HTTP 5xx). 메모리 부족 등은 잠시 뒤 다시 하면 되는 경우가 많다."""
 
 
+# '천천히 실행': Ollama가 쓰는 CPU 스레드를 줄이고 요청 사이에 쉬어 다른 작업에 자리를 내준다.
+GENTLE = False
+
+
 def _ollama_request(endpoint: str, model: str, body: dict, timeout: int) -> dict:
+    if GENTLE:
+        body = {**body, "options": {**body.get("options", {}), "num_thread": max(1, (os.cpu_count() or 4) // 4)}}
     for attempt in range(3):
         try:
-            return _ollama_once(endpoint, model, body, timeout)
+            started = time.monotonic()
+            result = _ollama_once(endpoint, model, body, timeout)
+            if GENTLE:
+                time.sleep(min(3.0, (time.monotonic() - started) / 2))  # 일한 시간의 절반만큼 쉰다.
+            return result
         except _ServerError:
             if attempt == 2:
                 raise

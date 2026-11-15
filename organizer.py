@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import csv
+import fnmatch
+import json
 import os
 import re
 import shutil
@@ -153,6 +155,16 @@ def _is_code_project(names: list[str]) -> bool:
     return any(name in PROJECT_MARKERS or name.casefold().endswith(".sln") for name in names)
 
 
+# 사용자가 정한 제외 패턴(폴더·파일 이름, 예: '임시', '*.tmp'). 앱이 시작할 때 채운다.
+# 미리보기와 정리 전 파일 목록 검사가 같은 목록을 써야 하므로 모듈 하나에 둔다.
+EXCLUDE: list[str] = []
+
+
+def is_excluded(name: str, patterns: list[str] | None = None) -> bool:
+    name = name.casefold()
+    return any(fnmatch.fnmatchcase(name, pattern.casefold()) for pattern in (EXCLUDE if patterns is None else patterns))
+
+
 def source_files(source: Path, destination: Path) -> tuple[list[Path], list[Path]]:
     """정리할 파일과 건드리지 않을 코드 프로젝트 폴더를 돌려준다. 미리보기와 이동 검사가 함께 쓴다."""
     source = source.resolve()
@@ -169,11 +181,12 @@ def source_files(source: Path, destination: Path) -> tuple[list[Path], list[Path
             continue
         folders[:] = sorted(
             name for name in folders
-            if name not in TOOL_FOLDERS and not (here / name).resolve().is_relative_to(destination)
+            if name not in TOOL_FOLDERS and not is_excluded(name)
+            and not (here / name).resolve().is_relative_to(destination)
         )
         files.extend(
             path for name in names
-            if (path := here / name).is_file() and not path.is_symlink()
+            if not is_excluded(name) and (path := here / name).is_file() and not path.is_symlink()
             and not path.resolve().is_relative_to(destination)
         )
     return sorted(files), projects
@@ -377,7 +390,7 @@ def _stage(source: Path, folder: Path, digest: bytes) -> Path:
 
 
 def _move_group(
-    members: list[Document], destination: Path, source_root: Path | None,
+    members: list[Document], destination: Path, source_root: Path | None, keep_originals: bool = False,
 ) -> list[tuple[Document, str, Path | str]]:
     """구성 파일 묶음은 모두 복사·검증된 뒤에만 원본을 지워 세트가 나뉘지 않게 한다."""
     staged: list[tuple[Document, bytes, Path, Path | None]] = []
@@ -411,6 +424,9 @@ def _move_group(
         return [(document, "이동 실패", message) for document in members]
     results: list[tuple[Document, str, Path | str]] = []
     for document, _, target, temporary in staged:
+        if keep_originals:
+            results.append((document, "복사" if temporary else "중복 건너뜀", target))
+            continue
         try:
             _remove(document.source)
             results.append((document, "이동" if temporary else "중복 정리", target))
@@ -419,14 +435,50 @@ def _move_group(
     return results
 
 
+def space_needed(documents: list[Document], destination: Path, keep_originals: bool) -> tuple[int, int]:
+    """(더 필요한 바이트, 남은 바이트). 0이면 충분하다.
+
+    복사 모드는 사본 전체가 새로 생긴다. 이동은 같은 드라이브면 파일 하나씩 잠깐만 늘어나지만,
+    다른 드라이브로 옮길 때는 결과 드라이브에 전체가 쌓인다. 중복 파일은 한 번만 센다.
+    여유분: 전체의 5%와 200MB 중 큰 값.
+    """
+    probe = destination
+    while not probe.exists() and probe.parent != probe:
+        probe = probe.parent
+    free = shutil.disk_usage(probe).free
+    seen: set[bytes] = set()
+    total = largest = 0
+    for doc in documents:
+        if doc.duplicate_of is not None:
+            continue
+        if doc.preview_digest:
+            if doc.preview_digest in seen:
+                continue
+            seen.add(doc.preview_digest)
+        try:
+            size = doc.source.stat().st_size
+        except OSError:
+            continue
+        total += size
+        largest = max(largest, size)
+    same_drive = all(doc.source.drive.casefold() == destination.drive.casefold() for doc in documents)
+    needed = total if keep_originals or not same_drive else largest
+    needed += max(needed // 20, 200 * 1024 * 1024)
+    return max(0, needed - free), free
+
+
 def move_documents(
     documents: list[Document], destination: Path,
     progress: Callable[[int, int], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
     source_root: Path | None = None,
     record: Callable[[Document, str, Path | str], None] | None = None,
+    keep_originals: bool = False,
 ) -> tuple[list[tuple[Document, Path]], list[tuple[Document, Path]], list[tuple[Document, str]]]:
-    """복사본과 원본의 내용이 같을 때만 원본을 제거한다. record는 파일마다 바로 호출된다."""
+    """복사본과 원본의 내용이 같을 때만 원본을 제거한다. record는 파일마다 바로 호출된다.
+
+    keep_originals(복사 모드)면 원본은 그대로 두고 검증된 사본만 만든다. 상태는 '복사'·'중복 건너뜀'.
+    """
     destination = destination.resolve()
     source_root = source_root.resolve() if source_root else None
     if not destination.is_dir():
@@ -490,7 +542,8 @@ def move_documents(
 
     def finish(document: Document, status: str, value: Path | str) -> None:
         nonlocal done
-        target = moved if status == "이동" else deduplicated if status == "중복 정리" else errors
+        target = (moved if status in {"이동", "복사"} else deduplicated if status in {"중복 정리", "중복 건너뜀"}
+                  else errors)
         target.append((document, value))
         if record:
             record(document, status, value)
@@ -501,7 +554,7 @@ def move_documents(
     for members in groups.values():
         if should_cancel and should_cancel():
             return moved, deduplicated, errors
-        for document, status, value in _move_group(members, destination, source_root):
+        for document, status, value in _move_group(members, destination, source_root, keep_originals):
             finish(document, status, value)
 
     for document in singles:
@@ -515,6 +568,9 @@ def move_documents(
                 # 기존 결과 파일이나 이번 실행에서 옮긴 파일도 다시 읽고 확인한다.
                 if _digest(source) != digest or _digest(matched) != digest:
                     raise ValueError("파일 내용이 검사 중 변경되었습니다")
+                if keep_originals:
+                    finish(document, "중복 건너뜀", matched)
+                    continue
                 _remove(source)
                 finish(document, "중복 정리", matched)
                 continue
@@ -532,6 +588,10 @@ def move_documents(
             if _digest(source) != digest or _digest(target) != digest:
                 _remove(target, missing_ok=True)
                 raise ValueError("이동 후 내용 검증 실패: 원본을 유지했습니다")
+            if keep_originals:
+                moved_by_digest[digest] = target
+                finish(document, "복사", target)
+                continue
             try:
                 _remove(source)
             except OSError as exc:
@@ -601,6 +661,45 @@ class ResultReport:
         self.close()
 
 
+PREVIEW_VERSION = 1
+
+
+def save_preview(path: Path, source: Path, destination: Path, documents: list[Document], extra: dict) -> None:
+    """미리보기를 JSON으로 저장한다. 다 쓴 뒤에 바꿔 넣어 저장 도중 꺼져도 예전 파일이 깨지지 않는다."""
+    rows = [{
+        "source": str(doc.source), "folder": doc.folder, "folder_reason": doc.folder_reason,
+        "method": doc.method, "error": doc.error,
+        "duplicate_of": str(doc.duplicate_of) if doc.duplicate_of else None,
+        "lead_text": doc.lead_text[:1200],
+        "preview_digest": doc.preview_digest.hex() if doc.preview_digest is not None else None,
+        "subfolder": doc.subfolder, "preserve_structure": doc.preserve_structure,
+        "output_name": doc.output_name, "detail": doc.detail,
+    } for doc in documents]
+    data = {"version": PREVIEW_VERSION, "source": str(source), "destination": str(destination),
+            "documents": rows, "extra": extra}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".partial")
+    temporary.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def load_preview(path: Path) -> tuple[Path, Path, list[Document], dict]:
+    """저장한 미리보기를 읽는다. 파일이 그 뒤에 바뀌었으면 정리할 때 내용 비교에서 걸러진다."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("version") != PREVIEW_VERSION:
+            raise ValueError("다른 버전의 미리보기 파일")
+        documents = [Document(
+            Path(row["source"]), row["folder"], row["folder_reason"], row["method"], row["error"],
+            Path(row["duplicate_of"]) if row["duplicate_of"] else None, row["lead_text"],
+            bytes.fromhex(row["preview_digest"]) if row["preview_digest"] is not None else None,
+            row["subfolder"], row["preserve_structure"], row["output_name"], row["detail"],
+        ) for row in data["documents"]]
+        return Path(data["source"]), Path(data["destination"]), documents, data.get("extra", {})
+    except (KeyError, TypeError, AttributeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"미리보기 파일을 읽을 수 없음: {exc}") from exc
+
+
 def undo_jobs(report: Path) -> list[tuple[str, Path, Path]]:
     """정리 결과 기록에서 되돌릴 (상태, 결과 파일, 원래 위치) 목록을 읽는다."""
     with report.open(encoding="utf-8-sig", newline="") as stream:
@@ -608,7 +707,7 @@ def undo_jobs(report: Path) -> list[tuple[str, Path, Path]]:
     if not rows or "원본 경로" not in rows[0]:
         raise ValueError("이 기록에는 원래 위치 정보가 없어 되돌릴 수 없습니다")
     jobs = [(row["상태"], Path(row["결과 파일"]), Path(row["원본 경로"]))
-            for row in rows if row["상태"] in {"이동", "중복 정리"}]
+            for row in rows if row["상태"] in {"이동", "중복 정리", "복사"}]
     # 중복 정리된 원본은 남겨 둔 사본을 복사해 되살리므로, 그 사본이 되돌아가기 전에 먼저 처리한다.
     return sorted(jobs, key=lambda job: job[0] != "중복 정리")
 
@@ -634,6 +733,13 @@ def undo_report(
                 raise ValueError("기록의 경로가 결과 폴더와 맞지 않습니다")
             if not result.is_file() or result.is_symlink():
                 raise ValueError("결과 폴더에 파일이 없습니다")
+            if status == "복사":
+                # 원본이 그대로 있으므로 사본만 지운다. 원본이 없거나 내용이 다르면 사본을 남긴다.
+                if not original.is_file() or _digest(original) != _digest(result):
+                    raise ValueError("원본이 없거나 바뀌어 사본을 남겼습니다")
+                _remove(result)
+                restored.append((result, original))
+                continue
             if original.exists() or original.is_symlink():
                 raise ValueError("원래 위치에 같은 이름의 파일이 이미 있어 건너뛰었습니다")
             original.parent.mkdir(parents=True, exist_ok=True)

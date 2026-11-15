@@ -228,6 +228,15 @@ class CenteredClusterTests(unittest.TestCase):
             self.assertEqual(ai_groups._ollama_request("/api/chat", "m", {}, 5), {"ok": True})
         self.assertEqual(len(calls), 3)
 
+    def test_gentle_mode_uses_fewer_threads_and_rests(self):
+        import ai_groups
+        seen = []
+        with mock.patch("ai_groups._ollama_once", side_effect=lambda e, m, body, t: seen.append(body) or {}),                 mock.patch("ai_groups.time.sleep") as rest, mock.patch.object(ai_groups, "GENTLE", True):
+            ai_groups._ollama_request("/api/chat", "m", {"options": {"temperature": 0}}, 5)
+        self.assertEqual(seen[0]["options"]["temperature"], 0)
+        self.assertGreaterEqual(seen[0]["options"]["num_thread"], 1)
+        rest.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
